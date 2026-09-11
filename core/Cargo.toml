@@ -3,44 +3,26 @@ name = "wherebus"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-typegen = []
-web = ["dep:axum", "tokio/net", "tokio/signal"]
-
 [[bin]]
 name = "wherebus-web"
 path = "src/bin/web.rs"
-required-features = ["web"]
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", optional = true }
+axum = "0.8"
 async-trait = "0.1"
-crux_core = "0.18.0"
-dirs = "6"
-futures-util = "0.3"
-redb = "4"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls-no-provider", "query", "form"] }
 rustls = "0.23"
 webpki-roots = "1.0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
-lru = "0.18"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }
 tracing = "0.1"
-urlencoding = "2"
 md-5 = "0.11"
 aes = "0.9"
 base64 = "0.22"
 ecb = { version = "0.2", features = ["alloc"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "fmt"] }
-zstd = "0.13"
-jni = { version = "0.22", default-features = false }
-pinyin = "0.11.0"
-
-[target.'cfg(target_os = "android")'.dependencies]
-tracing-android = "0.2"
