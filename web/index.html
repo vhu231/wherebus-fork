@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#125ae8"><title>WhereBus · 公交查询</title><link rel="stylesheet" href="/style.css"><script src="/bus-view.js" defer></script><script src="/app.js" defer></script></head>
+<body>
+<header><a href="/" class="brand">WhereBus<span>公交查询</span></a><span class="tag">实时公交 · API 驱动</span></header>
+<main>
+<section class="toolbar" aria-label="查询条件">
+<div class="intro"><span class="eyebrow">下一班，什么时候来？</span><h1>查公交，不必打开 App。</h1></div>
+<label>城市 / 数据源<select id="service" disabled><option>正在加载城市…</option></select></label>
+<form id="search"><label for="keyword">线路名称 / 起终点</label><div class="input-row"><input id="keyword" placeholder="输入线路或目的地" maxlength="80"><button id="search-button">查询线路</button></div></form>
+<details><summary>查找附近站点</summary><p>使用当前位置，或输入 WGS84 坐标。请先选择所在城市。</p><form id="nearby"><div class="coordinates"><label>纬度<input id="lat" type="number" step="any" min="-90" max="90" required placeholder="例如 24.87"></label><label>经度<input id="lng" type="number" step="any" min="-180" max="180" required placeholder="例如 118.67"></label></div><div class="input-row"><button type="button" id="locate" class="secondary">使用当前位置</button><button>查询附近</button></div></form></details>
+</section>
+<section class="workspace"><div class="results"><div class="section-head"><h2 id="result-title">查询结果</h2><span id="count"></span></div><p id="status" role="status" aria-live="polite">选择城市，输入线路名称开始查询。</p><div id="list"></div></div>
+<aside id="detail" aria-label="线路详情"><div class="empty"><span class="route-mark">BUS</span><h2>你的下一程</h2><p>选择一条线路，查看沿途站点和到站信息。</p></div></aside></section>
+<footer>到站时间仅供参考，以实际运营为准。数据由所选公交数据源提供。</footer>
+</main></body></html>
+
+

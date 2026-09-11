@@ -549,6 +549,8 @@ pub extern "system" fn Java_com_noctiro_wherebus_data_NativeWhereBusBridge_setDa
     use std::sync::Once;
     static INIT_TRACING: Once = Once::new();
     INIT_TRACING.call_once(|| {
+        #[cfg(target_os = "android")]
+        {
         use tracing_subscriber::filter;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -557,6 +559,7 @@ pub extern "system" fn Java_com_noctiro_wherebus_data_NativeWhereBusBridge_setDa
                 .with(filter::Targets::new().with_target("wherebus", tracing::Level::DEBUG))
                 .with(layer)
                 .init();
+        }
         }
     });
 

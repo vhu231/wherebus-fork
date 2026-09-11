@@ -5,12 +5,19 @@ edition = "2024"
 
 [features]
 typegen = []
+web = ["dep:axum", "tokio/net", "tokio/signal"]
+
+[[bin]]
+name = "wherebus-web"
+path = "src/bin/web.rs"
+required-features = ["web"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", optional = true }
 async-trait = "0.1"
 crux_core = "0.18.0"
 dirs = "6"
@@ -31,7 +38,9 @@ aes = "0.9"
 base64 = "0.22"
 ecb = { version = "0.2", features = ["alloc"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "fmt"] }
-tracing-android = "0.2"
 zstd = "0.13"
 jni = { version = "0.22", default-features = false }
 pinyin = "0.11.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
