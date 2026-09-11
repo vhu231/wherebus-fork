@@ -1,0 +1,7 @@
+# Normalize all text files to LF in the repository and on checkout,
+# regardless of each contributor's core.autocrlf / core.eol settings.
+* text=auto eol=lf
+
+# Binary files: never modify line endings or attempt text diffs.
+*.webp binary
+*.jar  binary
