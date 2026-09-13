@@ -83,6 +83,51 @@ cargo build --release
 
 环境变量 `WHEREBUS_BIND` 控制监听地址，默认 `127.0.0.1:8080`。对外提供服务时，通过 HTTPS 反向代理部署，并在代理层配置访问限流；管理控制台会暴露全部用户数据，务必只在 HTTPS 或受信网络下开放。浏览器定位需要 HTTPS 或 localhost；也支持手动输入 WGS84 经纬度。城市选择不会自动修改输入的坐标。
 
+## 部署（后台运行）
+
+服务器上不要用 `cargo run` 常驻：它会一直挂着 cargo 进程，也依赖完整工具链。先编译出 release 二进制，再交给 systemd 托管。
+
+```sh
+cargo build --release          # 产物：target/release/wherebus
+cp .env.example .env           # 填好 TELEGRAM_BOT_TOKEN 等
+```
+
+仓库里提供了 [`deploy/wherebus.service`](deploy/wherebus.service) 模板，把里面的 `User=` 与路径改成你自己的，然后：
+
+```sh
+sudo cp deploy/wherebus.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wherebus
+```
+
+常用操作：
+
+```sh
+systemctl status wherebus      # 运行状态
+journalctl -u wherebus -f      # 实时日志
+sudo systemctl restart wherebus
+sudo systemctl stop wherebus
+```
+
+几个要点：
+
+- `WorkingDirectory` 必须是仓库目录：`.env` 和默认的 `wherebus.db` 都按当前目录解析，服务用户需要对这个目录有写权限。
+- 配置由程序自己读 `.env`，不需要再写 systemd 的 `Environment=` / `EnvironmentFile=`（两者的引号与 `export` 规则并不一致）。
+- 默认只监听 `127.0.0.1:8080`。要从外网访问就配一个 HTTPS 反向代理指过去；直接把 `WHEREBUS_BIND` 改成 `0.0.0.0:8080` 会把管理控制台裸露在公网上。
+- 机器人是长轮询出站连接，不需要公网入口，也不需要开端口。
+
+更新到新版本（[`deploy/update.sh`](deploy/update.sh) 就是这三步）：
+
+```sh
+./deploy/update.sh             # git pull → cargo build --release → systemctl restart
+```
+
+临时想在后台跑一下、不装服务，可以用 `tmux`（推荐，随时能回去看）或：
+
+```sh
+nohup ./target/release/wherebus > wherebus.log 2>&1 &
+```
+
 ## HTTP API
 
 所有查询均为 GET。业务成功响应为 `{"data": ...}`；业务错误为 `{"error":"说明"}`，HTTP 状态为 400（参数错误）、502（数据源错误）、504（超时）。框架级缺少参数/类型错误可能返回纯文本 400，客户端兼容此情形。

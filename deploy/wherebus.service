@@ -1,0 +1,32 @@
+[Unit]
+Description=WhereBus 实时公交（网页 + 管理控制台 + Telegram 机器人）
+Documentation=https://github.com/noctiro/wherebus
+# 机器人启动时要连 Telegram，等网络真正就绪再拉起
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成你的用户与仓库路径
+User=radxa
+WorkingDirectory=/home/radxa/wherebus-fork
+# 配置从工作目录下的 .env 读取，这里不用再写 Environment=
+ExecStart=/home/radxa/wherebus-fork/target/release/wherebus
+
+# 崩了自动拉起；上游抽风时不要疯狂重启
+Restart=always
+RestartSec=5s
+
+# 日志进 journald：journalctl -u wherebus -f
+StandardOutput=journal
+StandardError=journal
+
+# 基本加固：只允许写仓库目录（SQLite 数据库在这里）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/radxa/wherebus-fork
+
+[Install]
+WantedBy=multi-user.target
