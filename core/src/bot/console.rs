@@ -212,23 +212,60 @@ async fn overview(State(console): State<Console>, headers: HeaderMap) -> ApiResu
 
 async fn list_users(State(console): State<Console>, headers: HeaderMap) -> ApiResult {
     console.authorize(&headers)?;
+    let defaults = console.store.settings().defaults;
     let users: Vec<Value> = console
         .store
         .all_users()
         .into_iter()
         .map(|(id, user)| {
+            let histogram = user.hour_histogram();
+            let peak = histogram
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, count)| **count)
+                .filter(|(_, count)| **count > 0)
+                .map(|(hour, _)| hour as u32);
+            let alerts = user.alerts.unwrap_or(defaults).clamped();
+
             json!({
                 "id": id,
                 "name": user.display_name,
                 "username": user.username,
                 "city": user.city_label,
-                "favorites": user.favorites.len(),
+                "service": user.service,
                 "queries": user.queries,
                 "last_seen": user.last_seen,
                 "first_seen": user.first_seen,
                 "banned": user.banned,
-                "watch": user.watch.as_ref().map(|watch| watch.label()),
-                "alerts": user.alerts.map(|alerts| alerts_json(&alerts, false)),
+                // 只说明有没有定位记录，不把坐标摆到管理界面上
+                "has_location": user.last_location.is_some(),
+                "favorites": user.favorites.len(),
+                "favorites_detail": user.favorites.iter().map(|favorite| json!({
+                    "line_name": favorite.line_name,
+                    "station_name": favorite.station_name,
+                    "city_label": favorite.city_label,
+                    "order": favorite.order,
+                    "hits": favorite.hits,
+                    "added_at": favorite.added_at,
+                })).collect::<Vec<_>>(),
+                "habits": user.top_habits(5).iter().map(|habit| json!({
+                    "label": habit.label,
+                    "total": habit.total,
+                    "last_at": habit.last_at,
+                })).collect::<Vec<_>>(),
+                "habit_lines": user.habits.len(),
+                "peak_hour": peak,
+                "hour_histogram": histogram,
+                "alerts": alerts_json(&alerts, user.alerts.is_none()),
+                "watch": user.watch.as_ref().map(|watch| json!({
+                    "label": watch.label(),
+                    "line_name": watch.line_name,
+                    "station_name": watch.station_name,
+                    "order": watch.order,
+                    "target_bus": watch.target_bus,
+                    "city_label": watch.city_label,
+                    "started_at": watch.started_at,
+                })),
             })
         })
         .collect();

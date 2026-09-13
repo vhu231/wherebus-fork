@@ -35,6 +35,11 @@ th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); v
 .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; background:var(--accent); color:var(--accent-fg); }
 .pill.off { background:var(--muted); }
 .actions { display:flex; gap:6px; flex-wrap:wrap; }
+.linky { background:none; border:0; padding:0; color:var(--accent); font:inherit; text-align:left; cursor:pointer; text-decoration:underline; }
+.detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; padding:4px 2px 8px; }
+.detail-grid h3 { font-size:13px; margin:0 0 6px; }
+tr.detail td { background:var(--bg); }
+.bars { font-family:ui-monospace,"Cascadia Mono",Consolas,monospace; letter-spacing:1px; white-space:nowrap; }
 </style>
 </head>
 <body>

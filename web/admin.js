@@ -186,39 +186,98 @@ async function loadConsole() {
 
   // 用户列表
   const table = el('div', null, 'card');
-  table.append(el('h2', `用户（${users.users.length}）`));
+  const tableHead = el('div', null, 'row');
+  tableHead.append(el('h2', `用户（${users.users.length}）`));
+  const search = el('input');
+  search.type = 'search';
+  search.placeholder = '搜索昵称 / 用户名 / ID / 城市 / 线路';
+  search.style.maxWidth = '260px';
+  tableHead.append(search);
+  table.append(tableHead);
+
   if (!users.users.length) table.append(el('p', '还没有用户。', 'muted'));
   const scroll = el('div', null, 'scroll');
-  const grid2 = el('table');
+  const userTable = el('table');
   const header = el('tr');
-  ['用户', '城市 / 盯车', '收藏·查询', '最近活跃', '操作'].forEach(title => header.append(el('th', title)));
-  grid2.append(header);
-  users.users.forEach(user => {
-    const row = el('tr');
-    const who = el('td');
-    who.append(el('div', `${user.name || '未命名'}${user.username ? ' @' + user.username : ''}`));
-    who.append(el('div', String(user.id), 'muted'));
-    if (user.banned) who.append(el('span', '已停用', 'pill off'));
-    row.append(who);
+  ['用户', '城市', '车次监控', '收藏 · 查询', '最近活跃', '操作'].forEach(title => header.append(el('th', title)));
+  userTable.append(header);
 
-    const where = el('td');
-    where.append(el('div', user.city || '未选择'));
-    if (user.watch) where.append(el('div', '🔔 ' + user.watch, 'muted'));
-    row.append(where);
+  const render = keyword => {
+    [...userTable.querySelectorAll('tr.user, tr.detail')].forEach(row => row.remove());
+    const needle = keyword.trim().toLowerCase();
+    const matched = users.users.filter(user => !needle || [
+      user.name, user.username, String(user.id), user.city,
+      user.watch && user.watch.label, ...(user.favorites_detail || []).map(f => `${f.line_name} ${f.station_name}`),
+    ].some(field => (field || '').toLowerCase().includes(needle)));
 
-    row.append(el('td', `${user.favorites} · ${user.queries}`));
-    row.append(el('td', since(user.last_seen)));
+    if (!matched.length && users.users.length) {
+      const empty = el('tr', null, 'user');
+      const cell = el('td', '没有匹配的用户。', 'muted');
+      cell.colSpan = 6;
+      empty.append(cell);
+      userTable.append(empty);
+      return;
+    }
 
-    const actions = el('td');
-    const box = el('div', null, 'actions');
-    if (user.watch) box.append(action('停盯车', 'ghost', user.id, 'stop_watch'));
-    box.append(action(user.banned ? '解除停用' : '停用', user.banned ? 'ghost' : 'danger', user.id, user.banned ? 'unban' : 'ban'));
-    box.append(action('删除数据', 'danger', user.id, 'delete'));
-    actions.append(box);
-    row.append(actions);
-    grid2.append(row);
-  });
-  scroll.append(grid2);
+    matched.forEach(user => {
+      const row = el('tr', null, 'user');
+
+      const who = el('td');
+      const name = el('button', `${user.name || '未命名'}${user.username ? ' @' + user.username : ''}`, 'linky');
+      who.append(name);
+      who.append(el('div', `ID ${user.id} · 加入 ${since(user.first_seen)}`, 'muted'));
+      if (user.banned) who.append(el('span', '已停用', 'pill off'));
+      row.append(who);
+
+      const where = el('td');
+      where.append(el('div', user.city || '未选择'));
+      if (user.service) where.append(el('div', user.service, 'muted'));
+      if (user.has_location) where.append(el('div', '有定位记录', 'muted'));
+      row.append(where);
+
+      const watching = el('td');
+      if (user.watch) {
+        watching.append(el('div', `🔔 ${user.watch.line_name} @ ${user.watch.station_name}`));
+        watching.append(el('div', `${user.watch.target_bus ? '车辆 ' + user.watch.target_bus : '最近的一班'} · 第 ${user.watch.order} 站`, 'muted'));
+        watching.append(el('div', `已监控 ${duration(Math.max(0, Date.now() / 1000 - user.watch.started_at))}`, 'muted'));
+      } else {
+        watching.append(el('div', '—', 'muted'));
+      }
+      row.append(watching);
+
+      const counts = el('td');
+      counts.append(el('div', `${user.favorites} 收藏 · ${user.queries} 次查询`));
+      counts.append(el('div', user.peak_hour == null
+        ? `记录线路 ${user.habit_lines} 条`
+        : `记录线路 ${user.habit_lines} 条 · 高峰 ${String(user.peak_hour).padStart(2, '0')}:00`, 'muted'));
+      row.append(counts);
+
+      row.append(el('td', since(user.last_seen)));
+
+      const actions = el('td');
+      const box = el('div', null, 'actions');
+      if (user.watch) box.append(action('停监控', 'ghost', user.id, 'stop_watch'));
+      box.append(action(user.banned ? '解除停用' : '停用', user.banned ? 'ghost' : 'danger', user.id, user.banned ? 'unban' : 'ban'));
+      box.append(action('删除数据', 'danger', user.id, 'delete'));
+      actions.append(box);
+      row.append(actions);
+      userTable.append(row);
+
+      // 展开行：提醒设置、收藏明细、常用线路
+      const detail = el('tr', null, 'detail');
+      detail.hidden = true;
+      const cell = el('td');
+      cell.colSpan = 6;
+      cell.append(detailPanel(user));
+      detail.append(cell);
+      userTable.append(detail);
+      name.onclick = () => { detail.hidden = !detail.hidden; };
+    });
+  };
+
+  search.oninput = () => render(search.value);
+  render('');
+  scroll.append(userTable);
   table.append(scroll);
   view.append(table);
 
@@ -249,6 +308,40 @@ async function loadConsole() {
   };
   security.append(form);
   view.append(security);
+}
+
+function detailPanel(user) {
+  const box = el('div', null, 'detail-grid');
+
+  const alerts = el('div');
+  alerts.append(el('h3', '提醒设置'));
+  alerts.append(el('div', user.alerts.using_defaults ? '跟随全局默认值' : '用户自定义', 'muted'));
+  user.alerts.fields.forEach(field => {
+    alerts.append(el('div', `${field.label}：${user.alerts.values[field.key]} ${field.unit}`, 'muted'));
+  });
+  box.append(alerts);
+
+  const favorites = el('div');
+  favorites.append(el('h3', `收藏车次（${user.favorites}）`));
+  if (!user.favorites_detail.length) favorites.append(el('div', '无', 'muted'));
+  user.favorites_detail.forEach(favorite => {
+    favorites.append(el('div', `${favorite.line_name} @ ${favorite.station_name}（第 ${favorite.order} 站）· 查过 ${favorite.hits} 次`, 'muted'));
+  });
+  box.append(favorites);
+
+  const habits = el('div');
+  habits.append(el('h3', '常用线路'));
+  if (!user.habits.length) habits.append(el('div', '还没有查询记录', 'muted'));
+  user.habits.forEach((habit, index) => {
+    habits.append(el('div', `${index + 1}. ${habit.label} — ${habit.total} 次（${since(habit.last_at)}）`, 'muted'));
+  });
+  const max = Math.max(1, ...user.hour_histogram);
+  const blocks = '▁▂▃▄▅▆▇█';
+  habits.append(el('div', user.hour_histogram.map(v => (v ? blocks[Math.round((v / max) * 7)] : '·')).join(''), 'bars'));
+  habits.append(el('div', '0     6     12    18   23', 'bars muted'));
+  box.append(habits);
+
+  return box;
 }
 
 function action(label, className, userId, name) {
