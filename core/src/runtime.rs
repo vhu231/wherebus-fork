@@ -4,7 +4,7 @@
 //! 没有配置 `TELEGRAM_BOT_TOKEN` 时不启动机器人，网页版与管理控制台照常可用。
 use std::{path::Path, sync::Arc};
 
-use crate::bot::{console, miniapp, store::Store};
+use crate::bot::{console, store::Store};
 
 pub async fn serve() -> anyhow::Result<()> {
     // 先读 .env（已存在的环境变量优先），再解析各项配置
@@ -32,21 +32,14 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     let bot = crate::bot::start(Arc::clone(&store)).await?;
-    let mut router = crate::web::router().merge(console::router(
-        Arc::clone(&store),
-        bot.clone(),
-    ));
-    if let Some(bot) = &bot {
-        router = router.merge(miniapp::router(Arc::clone(bot)));
-    }
+    let router = crate::web::router().merge(console::router(Arc::clone(&store), bot.clone()));
 
     let listener = tokio::net::TcpListener::bind(&address).await?;
     let address = listener.local_addr()?;
     println!("WhereBus: http://{address}");
     println!("管理控制台：http://{address}/admin · 数据库 {db_path}");
-    match &bot {
-        Some(_) => println!("Mini App（用户面板）：http://{address}/miniapp"),
-        None => println!("未设置 TELEGRAM_BOT_TOKEN，本次不启动机器人（网页与控制台照常可用）"),
+    if bot.is_none() {
+        println!("未设置 TELEGRAM_BOT_TOKEN，本次不启动机器人（网页与控制台照常可用）");
     }
 
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown());

@@ -7,7 +7,6 @@ pub mod app;
 pub mod auth;
 pub mod console;
 pub(crate) mod db;
-pub mod miniapp;
 pub mod render;
 pub mod store;
 pub mod telegram;

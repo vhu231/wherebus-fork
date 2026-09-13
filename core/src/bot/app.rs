@@ -3,7 +3,7 @@
 //! 交互全部用行内键盘完成：选城市 → 搜线路 → 选上车站 → 看实时到站 → 收藏。
 //! 用户数据（城市、收藏、习惯）通过 [`store::Store`] 落盘。
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -14,14 +14,12 @@ use std::{
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use crate::bot::auth::Sessions;
 use crate::bot::store::{
     AlertField, Favorite, Pending, Store, WatchSpec, local_clock, local_clock_secs, local_hour,
     now_secs,
 };
 use crate::bot::telegram::{
-    CallbackQuery, Message, Telegram, Update, callback_button, inline_keyboard, keyboard,
-    location_keyboard, remove_keyboard, web_app_button,
+    CallbackQuery, Message, Telegram, Update, inline_keyboard, location_keyboard,
 };
 use crate::bot::{render, watch};
 use crate::models::{BusRoute, LineDetail, RealTimeData};
@@ -49,6 +47,24 @@ const SEARCH_PAGE_SIZE: usize = 9;
 const STATION_PAGE_SIZE: usize = 10;
 const CITY_PAGE_SIZE: usize = 8;
 const MAX_TOKENS: usize = 20_000;
+/// 去重用的 update_id 环形窗口大小。
+const MAX_SEEN_UPDATES: usize = 2_000;
+
+const PROMPT_CITY: &str = "🏙 <b>选择城市</b>\n\n回复城市名或省份，例如「杭州」「泉州」「广东」。";
+const PROMPT_LINE: &str = "🔍 <b>搜索线路</b>\n\n回复线路关键词，例如「K155」「372」「机场」。";
+
+/// 一次交互的上下文。
+pub(crate) struct Ctx {
+    pub chat_id: i64,
+    pub user_id: i64,
+    /// 该用户的第几次操作，用于丢弃被新操作取代的旧渲染
+    pub epoch: u64,
+    /// 触发这次交互的消息（回调来的按钮所在消息）
+    pub source: Option<i64>,
+    /// 交互开始时的盯车卡片；这条消息由盯车循环维护，不能被导航内容覆盖。
+    /// 记在上下文里，是因为处理过程中盯车可能已经结束（例如「停止盯车」）。
+    pub watch_card: Option<i64>,
+}
 
 // ─── 按钮动作 ───
 
@@ -144,23 +160,84 @@ impl TokenTable {
     }
 }
 
+// ─── 并发与重复投递的防护 ───
+
+/// 已处理过的 update_id。Telegram 在没收到确认时会重发同一条更新，
+/// 重复执行会造成「一次点击、两次生效」。
+#[derive(Default)]
+struct SeenUpdates {
+    inner: Mutex<(HashSet<i64>, VecDeque<i64>)>,
+}
+
+impl SeenUpdates {
+    /// 第一次见到返回 true；重复的返回 false。
+    fn accept(&self, update_id: i64) -> bool {
+        let mut guard = self.inner.lock();
+        let (seen, order) = &mut *guard;
+        if !seen.insert(update_id) {
+            return false;
+        }
+        order.push_back(update_id);
+        while order.len() > MAX_SEEN_UPDATES {
+            if let Some(old) = order.pop_front() {
+                seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+/// 每个用户的操作序号：连点按钮或中途改点别处时，
+/// 先发起的那次请求即使后返回，也不再覆盖新界面。
+#[derive(Default)]
+struct Epochs {
+    inner: Mutex<HashMap<i64, u64>>,
+}
+
+impl Epochs {
+    fn begin(&self, user_id: i64) -> u64 {
+        let mut epochs = self.inner.lock();
+        let counter = epochs.entry(user_id).or_insert(0);
+        *counter += 1;
+        *counter
+    }
+
+    fn is_current(&self, user_id: i64, epoch: u64) -> bool {
+        self.inner.lock().get(&user_id).copied().unwrap_or(0) == epoch
+    }
+}
+
+/// 这次渲染应该改哪条消息：
+/// 用户点的那条优先（相当于「点哪张卡片，哪张就变成主卡片」），
+/// 但盯车卡片由盯车循环独占，不参与导航；都没有就返回 None，由调用方新发一条。
+fn card_target(source: Option<i64>, card: Option<i64>, watch_card: Option<i64>) -> Option<i64> {
+    match source {
+        Some(id) if Some(id) != watch_card => Some(id),
+        _ => card.filter(|id| Some(*id) != watch_card),
+    }
+}
+
 // ─── 应用状态 ───
 
 pub struct App {
     tg: Telegram,
     store: Arc<Store>,
-    sessions: Arc<Sessions>,
     tokens: TokenTable,
     providers: Mutex<HashMap<String, Arc<dyn BusDataProvider>>>,
     lines_cache: Mutex<HashMap<String, (Instant, Arc<Vec<BusRoute>>)>>,
     detail_cache: Mutex<HashMap<String, (Instant, Arc<LineDetail>)>>,
     /// 每个用户同时只有一个盯车任务
     watches: Mutex<HashMap<i64, tokio::task::AbortHandle>>,
+    /// 每个会话的主卡片消息 id：所有界面都渲染在这一条上
+    cards: Mutex<HashMap<i64, i64>>,
+    /// 每个用户的操作序号，用来丢弃被取代的旧渲染
+    epochs: Epochs,
+    /// 请求位置时发出的临时消息，收到位置后删除
+    location_prompts: Mutex<HashMap<i64, i64>>,
+    /// 已处理过的 update_id，避免重复投递被执行两次
+    seen_updates: SeenUpdates,
     tz_offset: i64,
     started_at: u64,
-    /// Mini App「我的面板」地址（必须是 HTTPS，Telegram 才允许打开）
-    miniapp_url: Option<String>,
-    bot_token: String,
     bot_username: String,
 }
 
@@ -190,10 +267,6 @@ pub async fn start(store: Arc<Store>) -> anyhow::Result<Option<Arc<App>>> {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|offset| (-12..=14).contains(offset))
         .unwrap_or(8);
-    let miniapp_url = std::env::var("WHEREBUS_BOT_MINIAPP_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
     let tg = Telegram::new(&token)?;
     let me = tg.get_me().await?;
     let username = me.username.clone().unwrap_or_else(|| me.first_name.clone());
@@ -201,16 +274,17 @@ pub async fn start(store: Arc<Store>) -> anyhow::Result<Option<Arc<App>>> {
     let app = Arc::new(App {
         tg,
         store: Arc::clone(&store),
-        sessions: Arc::new(Sessions::default()),
         tokens: TokenTable::default(),
         providers: Mutex::new(HashMap::new()),
         lines_cache: Mutex::new(HashMap::new()),
         detail_cache: Mutex::new(HashMap::new()),
         watches: Mutex::new(HashMap::new()),
+        cards: Mutex::new(HashMap::new()),
+        epochs: Epochs::default(),
+        location_prompts: Mutex::new(HashMap::new()),
+        seen_updates: SeenUpdates::default(),
         tz_offset,
         started_at: now_secs(),
-        miniapp_url: miniapp_url.clone(),
-        bot_token: token,
         bot_username: username.clone(),
     });
 
@@ -221,16 +295,6 @@ pub async fn start(store: Arc<Store>) -> anyhow::Result<Option<Arc<App>>> {
     );
     if let Err(error) = app.tg.set_my_commands(COMMANDS).await {
         eprintln!("[bot] 注册命令菜单失败：{error}");
-    }
-    match &miniapp_url {
-        Some(url) => {
-            // 聊天窗口左下角的菜单按钮直接打开「我的面板」
-            if let Err(error) = app.tg.set_chat_menu_button(url, "我的面板").await {
-                eprintln!("[bot] 设置 Mini App 菜单按钮失败：{error}");
-            }
-            println!("机器人：Mini App 我的面板 {url}");
-        }
-        None => println!("机器人：未设置 WHEREBUS_BOT_MINIAPP_URL，聊天里不显示「我的面板」入口"),
     }
     app.restore_watches();
     Ok(Some(app))
@@ -250,8 +314,17 @@ impl App {
                         backoff = 1;
                         for update in updates {
                             offset = offset.max(update.update_id + 1);
+                            // 去重与序号都在这里按投递顺序完成，之后才并发处理：
+                            // 这样「最新一次操作」的判断与用户实际点击顺序一致
+                            if !self.seen_updates.accept(update.update_id) {
+                                continue;
+                            }
+                            let Some(user_id) = update_actor(&update) else {
+                                continue;
+                            };
+                            let epoch = self.epochs.begin(user_id);
                             let app = Arc::clone(self);
-                            tokio::spawn(async move { app.handle(update).await });
+                            tokio::spawn(async move { app.handle(update, epoch).await });
                         }
                     }
                     Err(error) => {
@@ -281,14 +354,6 @@ impl App {
 
     pub(crate) fn store(&self) -> &Arc<Store> {
         &self.store
-    }
-
-    pub(crate) fn sessions(&self) -> &Arc<Sessions> {
-        &self.sessions
-    }
-
-    pub(crate) fn bot_token(&self) -> &str {
-        &self.bot_token
     }
 
     pub(crate) fn bot_username(&self) -> &str {
@@ -434,12 +499,89 @@ impl App {
         created
     }
 
+    // ─── 卡片：一个会话只维护一条可交互的消息 ───
+
+    /// 组装一次交互的上下文：谁、点在哪条消息上、第几次操作。
+    /// `epoch` 由拉取循环按投递顺序分配。
+    fn context(&self, chat_id: i64, user_id: i64, source: Option<i64>, epoch: u64) -> Ctx {
+        Ctx {
+            chat_id,
+            user_id,
+            epoch,
+            source,
+            watch_card: self.watch_card_of(user_id),
+        }
+    }
+
+    /// 这次操作是否仍是该用户最新的一次。连点按钮、或等数据时又点了别处，
+    /// 旧操作取回数据后不再覆盖新界面。
+    fn is_current(&self, ctx: &Ctx) -> bool {
+        self.epochs.is_current(ctx.user_id, ctx.epoch)
+    }
+
+    fn card_of(&self, chat_id: i64) -> Option<i64> {
+        self.cards.lock().get(&chat_id).copied()
+    }
+
+    /// 盯车卡片由盯车循环自己刷新，不能被导航内容覆盖。
+    fn watch_card_of(&self, user_id: i64) -> Option<i64> {
+        self.store
+            .get(user_id)
+            .watch
+            .map(|watch| watch.card_message_id)
+    }
+
+    /// 把界面渲染到会话的主卡片上：能编辑就原地改，改不动才新发一条。
+    pub(crate) async fn show(&self, ctx: &Ctx, text: &str, markup: Option<Value>) {
+        if !self.is_current(ctx) {
+            return;
+        }
+        let watch_card = ctx.watch_card;
+        let target = card_target(ctx.source, self.card_of(ctx.chat_id), watch_card);
+
+        if let Some(target) = target {
+            match self
+                .tg
+                .edit_message_text(ctx.chat_id, target, text, markup.clone())
+                .await
+            {
+                // 内容没变化说明界面已经是这样了，同样算成功
+                Ok(_) => {
+                    self.cards.lock().insert(ctx.chat_id, target);
+                    return;
+                }
+                Err(error) if error.is_not_modified() => {
+                    self.cards.lock().insert(ctx.chat_id, target);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("[bot] 卡片 {target} 无法编辑（{error}），改为新发一条");
+                }
+            }
+        }
+
+        match self.tg.send_message(ctx.chat_id, text, markup).await {
+            Ok(message) => {
+                let previous = self.cards.lock().insert(ctx.chat_id, message.message_id);
+                // 旧卡片留在聊天记录里会让人点到过期界面，这里让它退役
+                if let Some(previous) = previous.filter(|id| Some(*id) != watch_card) {
+                    let _ = self
+                        .tg
+                        .edit_message_text(ctx.chat_id, previous, "⬇️ 已在下面的新卡片继续", None)
+                        .await;
+                }
+            }
+            Err(error) => eprintln!("[bot] 发送卡片失败：{error}"),
+        }
+    }
+
     pub(crate) async fn send(&self, chat_id: i64, text: &str, markup: Option<Value>) {
         if let Err(error) = self.tg.send_message(chat_id, text, markup).await {
             eprintln!("[bot] 发送消息失败：{error}");
         }
     }
 
+    /// 直接编辑指定消息（盯车卡片用，不走主卡片逻辑）。
     pub(crate) async fn edit(
         &self,
         chat_id: i64,
@@ -461,24 +603,24 @@ impl App {
         }
     }
 
-    async fn handle(self: Arc<Self>, update: Update) {
+    async fn handle(self: Arc<Self>, update: Update, epoch: u64) {
         if let Some(message) = update.message {
-            self.handle_message(message).await;
+            self.handle_message(message, epoch).await;
         } else if let Some(callback) = update.callback_query {
-            self.handle_callback(callback).await;
+            self.handle_callback(callback, epoch).await;
         }
     }
 
     // ─── 消息 ───
 
     /// 停用 / 停止接纳新用户的统一闸门；返回 false 表示不再继续处理。
-    async fn admit(&self, chat_id: i64, user_id: i64, from: Option<&crate::bot::telegram::User>) -> bool {
-        if self.store.get(user_id).banned {
-            self.send(chat_id, "你的账号已被管理员停用。", None).await;
+    async fn admit(&self, ctx: &Ctx, from: Option<&crate::bot::telegram::User>) -> bool {
+        if self.store.get(ctx.user_id).banned {
+            self.show(ctx, "你的账号已被管理员停用。", None).await;
             return false;
         }
-        if !self.store.settings().allow_new_users && !self.store.exists(user_id) {
-            self.send(chat_id, "机器人当前不接受新用户，请联系管理员。", None)
+        if !self.store.settings().allow_new_users && !self.store.exists(ctx.user_id) {
+            self.show(ctx, "机器人当前不接受新用户，请联系管理员。", None)
                 .await;
             return false;
         }
@@ -486,7 +628,7 @@ impl App {
             // 管理界面需要看得懂是谁，这里顺手记下昵称
             let name = from.first_name.clone();
             let username = from.username.clone();
-            self.store.update(user_id, |user| {
+            self.store.update(ctx.user_id, |user| {
                 user.display_name = name;
                 user.username = username;
             });
@@ -494,15 +636,17 @@ impl App {
         true
     }
 
-    async fn handle_message(self: &Arc<Self>, message: Message) {
+    async fn handle_message(self: &Arc<Self>, message: Message, epoch: u64) {
         let chat_id = message.chat.id;
         let user_id = message.from.as_ref().map(|u| u.id).unwrap_or(chat_id);
-        if !self.admit(chat_id, user_id, message.from.as_ref()).await {
+        // 文本命令也渲染到主卡片，不再每条命令堆一张新卡
+        let ctx = self.context(chat_id, user_id, None, epoch);
+        if !self.admit(&ctx, message.from.as_ref()).await {
             return;
         }
 
         if let Some(location) = message.location {
-            self.on_location(chat_id, user_id, location.latitude, location.longitude)
+            self.on_location(&ctx, location.latitude, location.longitude)
                 .await;
             return;
         }
@@ -512,174 +656,193 @@ impl App {
         };
 
         if let Some((command, argument)) = parse_command(text) {
-            self.on_command(chat_id, user_id, &command, &argument).await;
+            self.on_command(&ctx, &command, &argument).await;
             return;
         }
 
         // 非命令文本：按当前等待状态解释
-        let pending = self.store.get(user_id).pending;
-        match pending {
-            Pending::City => self.show_cities(chat_id, user_id, text, 0, None).await,
+        match self.store.get(user_id).pending {
+            Pending::City => {
+                let (body, markup) = self.cities_view(user_id, text, 0);
+                self.show(&ctx, &body, markup).await;
+            }
             _ => {
                 if self.store.get(user_id).service.is_some() {
-                    self.show_search(chat_id, user_id, text, 0, None).await;
+                    let (body, markup) = self.search_view(user_id, text, 0).await;
+                    self.show(&ctx, &body, markup).await;
                 } else {
-                    self.store.update(user_id, |user| user.pending = Pending::City);
-                    self.send(
-                        chat_id,
-                        "请先选择城市：直接回复城市名（例如「杭州」或「浙江」），或使用 /city。",
-                        None,
-                    )
-                    .await;
+                    self.store
+                        .update(user_id, |user| user.pending = Pending::City);
+                    self.show(&ctx, PROMPT_CITY, Some(self.prompt_keyboard()))
+                        .await;
                 }
             }
         }
     }
 
-    async fn on_command(
-        self: &Arc<Self>,
-        chat_id: i64,
-        user_id: i64,
-        command: &str,
-        argument: &str,
-    ) {
+    async fn on_command(self: &Arc<Self>, ctx: &Ctx, command: &str, argument: &str) {
+        let user_id = ctx.user_id;
         match command {
             "start" | "home" => {
-                self.store.update(user_id, |user| user.pending = Pending::None);
+                self.store
+                    .update(user_id, |user| user.pending = Pending::None);
                 let (text, markup) = self.home_view(user_id);
-                self.send(chat_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
-            "help" => self.send(chat_id, HELP_TEXT, None).await,
+            "help" => {
+                self.show(ctx, HELP_TEXT, Some(inline_keyboard(vec![home_row()])))
+                    .await
+            }
             "city" | "cities" => {
                 if argument.is_empty() {
-                    self.store.update(user_id, |user| user.pending = Pending::City);
-                    self.send(
-                        chat_id,
-                        "请回复城市名或省份，例如「杭州」「泉州」「广东」。",
-                        Some(remove_keyboard()),
-                    )
-                    .await;
+                    self.store
+                        .update(user_id, |user| user.pending = Pending::City);
+                    self.show(ctx, PROMPT_CITY, Some(self.prompt_keyboard()))
+                        .await;
                 } else {
-                    self.show_cities(chat_id, user_id, argument, 0, None).await;
+                    let (text, markup) = self.cities_view(user_id, argument, 0);
+                    self.show(ctx, &text, markup).await;
                 }
             }
             "line" | "search" | "bus" => {
                 if self.store.get(user_id).service.is_none() {
-                    self.store.update(user_id, |user| user.pending = Pending::City);
-                    self.send(chat_id, "还没选城市。请先回复城市名，或使用 /city。", None)
+                    self.store
+                        .update(user_id, |user| user.pending = Pending::City);
+                    self.show(ctx, PROMPT_CITY, Some(self.prompt_keyboard()))
                         .await;
                     return;
                 }
                 if argument.is_empty() {
-                    self.store.update(user_id, |user| user.pending = Pending::Line);
-                    self.send(chat_id, "请回复线路关键词，例如「K155」「372」「机场」。", None)
+                    self.store
+                        .update(user_id, |user| user.pending = Pending::Line);
+                    self.show(ctx, PROMPT_LINE, Some(self.prompt_keyboard()))
                         .await;
                 } else {
-                    self.show_search(chat_id, user_id, argument, 0, None).await;
+                    let (text, markup) = self.search_view(user_id, argument, 0).await;
+                    self.show(ctx, &text, markup).await;
                 }
             }
-            "nearby" | "near" => self.ask_location(chat_id, user_id).await,
+            "nearby" | "near" => self.ask_location(ctx).await,
             "fav" | "favs" | "favorites" | "favourite" => {
                 let (text, markup) = self.favorites_view(user_id);
-                self.send(chat_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
             "watch" | "watching" => {
                 let (text, markup) = self.watch_view(user_id);
-                self.send(chat_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
             "settings" | "setting" | "alerts" => {
                 let (text, markup) = self.settings_view(user_id);
-                self.send(chat_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
-            "app" | "panel" => match &self.miniapp_url {
-                Some(url) => {
-                    self.send(
-                        chat_id,
-                        "🧭 <b>我的面板</b>
-在小程序里管理城市、收藏、提醒偏好，并直接开始车次监控。",
-                        Some(keyboard(vec![vec![web_app_button("🧭 打开我的面板", url)]])),
-                    )
-                    .await;
-                }
-                None => {
-                    self.send(
-                        chat_id,
-                        "管理员还没有配置 Mini App 地址（环境变量 WHEREBUS_BOT_MINIAPP_URL）。",
-                        None,
-                    )
-                    .await;
-                }
-            },
             "habits" | "stats" | "me" => {
                 let (text, markup) = self.habits_view(user_id);
-                self.send(chat_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
             "cancel" => {
-                self.store.update(user_id, |user| user.pending = Pending::None);
-                self.send(chat_id, "已取消当前输入。", Some(remove_keyboard()))
+                self.store
+                    .update(user_id, |user| user.pending = Pending::None);
+                let (text, markup) = self.home_view(user_id);
+                self.show(ctx, &format!("已取消当前输入。\n\n{text}"), Some(markup))
                     .await;
             }
             _ => {
-                self.send(chat_id, "不认识这个命令。发送 /help 查看用法。", None)
-                    .await;
+                let (text, markup) = self.home_view(user_id);
+                self.show(
+                    ctx,
+                    &format!("不认识这个命令，发送 /help 查看用法。\n\n{text}"),
+                    Some(markup),
+                )
+                .await;
             }
         }
     }
 
-    async fn on_location(&self, chat_id: i64, user_id: i64, latitude: f64, longitude: f64) {
+    /// 等待用户输入时的卡片按钮。
+    fn prompt_keyboard(&self) -> Value {
+        inline_keyboard(vec![vec![("↩️ 取消".into(), "m:home".into())]])
+    }
+
+    async fn on_location(&self, ctx: &Ctx, latitude: f64, longitude: f64) {
+        // 位置已经发来了，请求位置的那条提示消息就没用了
+        self.clear_location_prompt(ctx.chat_id).await;
         if !(latitude.is_finite() && longitude.is_finite()) {
-            self.send(chat_id, "位置无效，请重新发送。", None).await;
+            self.show(
+                ctx,
+                "位置无效，请重新发送。",
+                Some(inline_keyboard(vec![home_row()])),
+            )
+            .await;
             return;
         }
-        let Some(service) = self.store.get(user_id).service else {
-            self.store.update(user_id, |user| user.pending = Pending::City);
-            self.send(chat_id, "还没选城市。请先回复城市名，或使用 /city。", None)
+        let Some(service) = self.store.get(ctx.user_id).service else {
+            self.store
+                .update(ctx.user_id, |user| user.pending = Pending::City);
+            self.show(ctx, PROMPT_CITY, Some(self.prompt_keyboard()))
                 .await;
             return;
         };
         // provider 接受 GCJ-02 坐标，与网页端同一套换算
         let (lat, lng) = wgs84_to_gcj02(latitude, longitude);
-        self.store.update(user_id, |user| {
+        self.store.update(ctx.user_id, |user| {
             user.last_location = Some((lat, lng));
             user.pending = Pending::None;
         });
-        self.send(chat_id, "已收到位置，正在查询附近站点…", Some(remove_keyboard()))
-            .await;
         let (text, markup) = self.nearby_view(&service, lat, lng).await;
-        self.send(chat_id, &text, markup).await;
+        self.show(ctx, &text, markup).await;
     }
 
-    async fn ask_location(&self, chat_id: i64, user_id: i64) {
-        let user = self.store.get(user_id);
+    async fn ask_location(&self, ctx: &Ctx) {
+        let user = self.store.get(ctx.user_id);
         if user.service.is_none() {
-            self.store.update(user_id, |user| user.pending = Pending::City);
-            self.send(chat_id, "还没选城市。请先回复城市名，或使用 /city。", None)
+            self.store
+                .update(ctx.user_id, |user| user.pending = Pending::City);
+            self.show(ctx, PROMPT_CITY, Some(self.prompt_keyboard()))
                 .await;
             return;
         }
+
+        let mut rows: Vec<Vec<(String, String)>> = Vec::new();
         if user.last_location.is_some() {
-            let markup = inline_keyboard(vec![vec![(
+            rows.push(vec![(
                 "📍 用上次的位置".into(),
                 self.tokens.put(Action::NearbyHere),
-            )]]);
-            self.send(
-                chat_id,
-                "点下面的按钮发送当前位置，或使用上次的位置：",
-                Some(markup),
-            )
-            .await;
+            )]);
         }
-        self.send(
-            chat_id,
-            "请发送你的位置（点击下方按钮，私聊可用）。位置只用于查询附近站点，会保存为你最近一次坐标。",
-            Some(location_keyboard()),
+        rows.push(home_row());
+        self.show(
+            ctx,
+            "📍 <b>附近站点</b>\n\n用下方的「发送我的位置」按钮共享位置。位置只用于查询附近站点，会保存为你最近一次坐标。",
+            Some(inline_keyboard(rows)),
         )
         .await;
+
+        // 共享位置需要普通键盘，只能单独发一条；收到位置后删掉
+        self.clear_location_prompt(ctx.chat_id).await;
+        match self
+            .tg
+            .send_message(ctx.chat_id, "👇 点这里发送位置", Some(location_keyboard()))
+            .await
+        {
+            Ok(message) => {
+                self.location_prompts
+                    .lock()
+                    .insert(ctx.chat_id, message.message_id);
+            }
+            Err(error) => eprintln!("[bot] 请求位置失败：{error}"),
+        }
+    }
+
+    async fn clear_location_prompt(&self, chat_id: i64) {
+        let Some(message_id) = self.location_prompts.lock().remove(&chat_id) else {
+            return;
+        };
+        let _ = self.tg.delete_message(chat_id, message_id).await;
     }
 
     // ─── 回调 ───
 
-    async fn handle_callback(self: &Arc<Self>, callback: CallbackQuery) {
+    async fn handle_callback(self: &Arc<Self>, callback: CallbackQuery, epoch: u64) {
         let user_id = callback.from.id;
         let Some(message) = callback.message.as_ref() else {
             let _ = self
@@ -689,10 +852,10 @@ impl App {
             return;
         };
         let chat_id = message.chat.id;
-        let message_id = message.message_id;
         let data = callback.data.clone().unwrap_or_default();
+        let ctx = self.context(chat_id, user_id, Some(message.message_id), epoch);
 
-        if !self.admit(chat_id, user_id, Some(&callback.from)).await {
+        if !self.admit(&ctx, Some(&callback.from)).await {
             let _ = self
                 .tg
                 .answer_callback_query(&callback.id, "账号不可用", true)
@@ -702,14 +865,18 @@ impl App {
 
         if let Some(menu) = data.strip_prefix("m:") {
             let _ = self.tg.answer_callback_query(&callback.id, "", false).await;
-            self.handle_menu(chat_id, message_id, user_id, menu).await;
+            self.handle_menu(&ctx, menu).await;
             return;
         }
 
         let Some(action) = self.tokens.get(&data) else {
             let _ = self
                 .tg
-                .answer_callback_query(&callback.id, "按钮已过期（机器人重启过），请重新查询。", true)
+                .answer_callback_query(
+                    &callback.id,
+                    "按钮已过期（机器人重启过），请重新查询。",
+                    true,
+                )
                 .await;
             return;
         };
@@ -727,21 +894,20 @@ impl App {
                     user.pending = Pending::None;
                 });
                 let (text, markup) = self.home_view(user_id);
-                self.edit(
-                    chat_id,
-                    message_id,
+                self.show(
+                    &ctx,
                     &format!("✅ 已切换到 <b>{}</b>\n\n{text}", render::escape(&label)),
                     Some(markup),
                 )
                 .await;
             }
             Action::CityPage { keyword, page } => {
-                self.show_cities(chat_id, user_id, &keyword, page, Some(message_id))
-                    .await;
+                let (text, markup) = self.cities_view(user_id, &keyword, page);
+                self.show(&ctx, &text, markup).await;
             }
             Action::SearchPage { keyword, page } => {
-                self.show_search(chat_id, user_id, &keyword, page, Some(message_id))
-                    .await;
+                let (text, markup) = self.search_view(user_id, &keyword, page).await;
+                self.show(&ctx, &text, markup).await;
             }
             Action::Line {
                 service,
@@ -749,16 +915,17 @@ impl App {
                 page,
             } => {
                 let (text, markup) = self.line_view(user_id, &service, &direction, page).await;
-                self.edit(chat_id, message_id, &text, markup).await;
+                self.show(&ctx, &text, markup).await;
             }
             Action::Live {
                 service,
                 direction,
                 order,
             } => {
-                let (text, markup) =
-                    self.live_view(user_id, &service, &direction, order, true).await;
-                self.edit(chat_id, message_id, &text, markup).await;
+                let (text, markup) = self
+                    .live_view(user_id, &service, &direction, order, true)
+                    .await;
+                self.show(&ctx, &text, markup).await;
             }
             Action::FavToggle {
                 service,
@@ -768,9 +935,10 @@ impl App {
                 self.toggle_favorite(user_id, &service, &direction, order)
                     .await;
                 // 收藏按钮只是重绘同一页，不再算作一次新的查询
-                let (text, markup) =
-                    self.live_view(user_id, &service, &direction, order, false).await;
-                self.edit(chat_id, message_id, &text, markup).await;
+                let (text, markup) = self
+                    .live_view(user_id, &service, &direction, order, false)
+                    .await;
+                self.show(&ctx, &text, markup).await;
             }
             Action::FavRemove {
                 service,
@@ -783,7 +951,7 @@ impl App {
                     }
                 });
                 let (text, markup) = self.favorites_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(&ctx, &text, Some(markup)).await;
             }
             Action::Station {
                 service,
@@ -792,18 +960,22 @@ impl App {
                 lng,
             } => {
                 let (text, markup) = self.station_view(&service, &name, lat, lng).await;
-                self.edit(chat_id, message_id, &text, markup).await;
+                self.show(&ctx, &text, markup).await;
             }
             Action::NearbyHere => {
                 let user = self.store.get(user_id);
                 match (user.service, user.last_location) {
                     (Some(service), Some((lat, lng))) => {
                         let (text, markup) = self.nearby_view(&service, lat, lng).await;
-                        self.edit(chat_id, message_id, &text, markup).await;
+                        self.show(&ctx, &text, markup).await;
                     }
                     _ => {
-                        self.edit(chat_id, message_id, "还没有保存过位置，请用 /nearby 发送位置。", None)
-                            .await;
+                        self.show(
+                            &ctx,
+                            "还没有保存过位置，请用 /nearby 发送位置。",
+                            Some(inline_keyboard(vec![home_row()])),
+                        )
+                        .await;
                     }
                 }
             }
@@ -813,7 +985,7 @@ impl App {
                 order,
             } => {
                 let (text, markup) = self.watch_setup_view(&service, &direction, order).await;
-                self.edit(chat_id, message_id, &text, markup).await;
+                self.show(&ctx, &text, markup).await;
             }
             Action::WatchStart {
                 service,
@@ -821,14 +993,19 @@ impl App {
                 order,
                 bus,
             } => {
-                self.start_watch(user_id, chat_id, &service, &direction, order, bus)
+                self.start_watch(&ctx, &service, &direction, order, bus)
                     .await;
             }
             Action::WatchStop => {
-                if !self.stop_watch(user_id, "你手动停止了盯车。").await {
-                    self.edit(chat_id, message_id, "当前没有进行中的盯车。", None)
-                        .await;
-                }
+                let stopped = self.stop_watch(user_id, "你手动停止了盯车。").await;
+                let (text, markup) = self.home_view(user_id);
+                let prefix = if stopped {
+                    "⏹ 盯车已停止。\n\n"
+                } else {
+                    "当前没有进行中的盯车。\n\n"
+                };
+                self.show(&ctx, &format!("{prefix}{text}"), Some(markup))
+                    .await;
             }
             Action::SettingsAdjust { field, steps } => {
                 let defaults = self.store.settings().defaults;
@@ -838,56 +1015,58 @@ impl App {
                     user.alerts = Some(alerts);
                 });
                 let (text, markup) = self.settings_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(&ctx, &text, Some(markup)).await;
             }
             Action::SettingsReset => {
                 self.store.update(user_id, |user| user.alerts = None);
                 let (text, markup) = self.settings_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(&ctx, &text, Some(markup)).await;
             }
         }
     }
 
-    async fn handle_menu(
-        self: &Arc<Self>,
-        chat_id: i64,
-        message_id: i64,
-        user_id: i64,
-        menu: &str,
-    ) {
+    async fn handle_menu(self: &Arc<Self>, ctx: &Ctx, menu: &str) {
+        let user_id = ctx.user_id;
         match menu {
             "home" => {
+                self.store
+                    .update(user_id, |user| user.pending = Pending::None);
                 let (text, markup) = self.home_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
             "fav" => {
                 let (text, markup) = self.favorites_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
             "habit" => {
                 let (text, markup) = self.habits_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
             "city" => {
-                self.store.update(user_id, |user| user.pending = Pending::City);
-                self.send(chat_id, "请回复城市名或省份，例如「杭州」「广东」。", None)
+                self.store
+                    .update(user_id, |user| user.pending = Pending::City);
+                self.show(ctx, PROMPT_CITY, Some(self.prompt_keyboard()))
                     .await;
             }
             "search" => {
-                self.store.update(user_id, |user| user.pending = Pending::Line);
-                self.send(chat_id, "请回复线路关键词，例如「K155」「机场」。", None)
+                self.store
+                    .update(user_id, |user| user.pending = Pending::Line);
+                self.show(ctx, PROMPT_LINE, Some(self.prompt_keyboard()))
                     .await;
             }
-            "nearby" => self.ask_location(chat_id, user_id).await,
+            "nearby" => self.ask_location(ctx).await,
             "settings" => {
                 let (text, markup) = self.settings_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
             "watch" => {
                 let (text, markup) = self.watch_view(user_id);
-                self.edit(chat_id, message_id, &text, Some(markup)).await;
+                self.show(ctx, &text, Some(markup)).await;
             }
-            "help" => self.send(chat_id, HELP_TEXT, None).await,
+            "help" => {
+                self.show(ctx, HELP_TEXT, Some(inline_keyboard(vec![home_row()])))
+                    .await
+            }
             _ => {}
         }
     }
@@ -944,28 +1123,11 @@ impl App {
             ("❓ 使用说明".into(), "m:help".into()),
         ]);
 
-        let mut buttons: Vec<Vec<Value>> = rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|(label, data)| callback_button(label, data))
-                    .collect()
-            })
-            .collect();
-        if let Some(url) = &self.miniapp_url {
-            buttons.push(vec![web_app_button("🧭 我的面板", url)]);
-        }
-        (text, keyboard(buttons))
+        (text, inline_keyboard(rows))
     }
 
-    async fn show_cities(
-        &self,
-        chat_id: i64,
-        user_id: i64,
-        keyword: &str,
-        page: usize,
-        edit_message: Option<i64>,
-    ) {
+    /// 城市选择界面。
+    fn cities_view(&self, user_id: i64, keyword: &str, page: usize) -> (String, Option<Value>) {
         let keyword = keyword.trim();
         let matches: Vec<(String, String, String)> = provider::available_services()
             .into_iter()
@@ -990,11 +1152,7 @@ impl App {
                 "没有找到匹配「{}」的城市。换个关键词试试（支持城市名或省份）。注意：只有已接入数据源的城市才能查到。",
                 render::escape(keyword)
             );
-            match edit_message {
-                Some(message_id) => self.edit(chat_id, message_id, &text, None).await,
-                None => self.send(chat_id, &text, None).await,
-            }
-            return;
+            return (text, Some(self.prompt_keyboard()));
         }
 
         let pages = matches.len().div_ceil(CITY_PAGE_SIZE).max(1);
@@ -1026,14 +1184,9 @@ impl App {
             page + 1,
             pages
         );
-        self.store.update(user_id, |user| user.pending = Pending::None);
-        match edit_message {
-            Some(message_id) => {
-                self.edit(chat_id, message_id, &text, Some(inline_keyboard(rows)))
-                    .await
-            }
-            None => self.send(chat_id, &text, Some(inline_keyboard(rows))).await,
-        }
+        self.store
+            .update(user_id, |user| user.pending = Pending::None);
+        (text, Some(inline_keyboard(rows)))
     }
 
     async fn all_lines(&self, service: &str) -> Result<Arc<Vec<BusRoute>>, String> {
@@ -1066,30 +1219,23 @@ impl App {
         Ok(detail)
     }
 
-    async fn show_search(
+    /// 线路搜索结果界面。
+    async fn search_view(
         &self,
-        chat_id: i64,
         user_id: i64,
         keyword: &str,
         page: usize,
-        edit_message: Option<i64>,
-    ) {
+    ) -> (String, Option<Value>) {
         let keyword = keyword.trim().to_string();
-        self.store.update(user_id, |user| user.pending = Pending::None);
+        self.store
+            .update(user_id, |user| user.pending = Pending::None);
         let Some(service) = self.store.get(user_id).service else {
-            self.send(chat_id, "还没选城市，请先用 /city 选择。", None).await;
-            return;
+            return (PROMPT_CITY.to_string(), Some(self.prompt_keyboard()));
         };
 
         let lines = match self.all_lines(&service).await {
             Ok(lines) => lines,
-            Err(error) => {
-                match edit_message {
-                    Some(message_id) => self.edit(chat_id, message_id, &error, None).await,
-                    None => self.send(chat_id, &error, None).await,
-                }
-                return;
-            }
+            Err(error) => return (error, Some(inline_keyboard(vec![home_row()]))),
         };
 
         let needle = keyword.to_lowercase();
@@ -1107,11 +1253,7 @@ impl App {
                 "没有找到匹配「{}」的线路。换个关键词，或用 /city 确认城市是否正确。",
                 render::escape(&keyword)
             );
-            match edit_message {
-                Some(message_id) => self.edit(chat_id, message_id, &text, None).await,
-                None => self.send(chat_id, &text, None).await,
-            }
-            return;
+            return (text, Some(self.prompt_keyboard()));
         }
 
         let pages = matches.len().div_ceil(SEARCH_PAGE_SIZE).max(1);
@@ -1170,14 +1312,7 @@ impl App {
             rows.push(pager);
         }
         rows.push(vec![("🏠 主菜单".into(), "m:home".into())]);
-
-        match edit_message {
-            Some(message_id) => {
-                self.edit(chat_id, message_id, &text, Some(inline_keyboard(rows)))
-                    .await
-            }
-            None => self.send(chat_id, &text, Some(inline_keyboard(rows))).await,
-        }
+        (text, Some(inline_keyboard(rows)))
     }
 
     async fn line_view(
@@ -1447,13 +1582,13 @@ impl App {
     /// 建立卡片消息并启动盯车循环。
     pub(crate) async fn start_watch(
         self: &Arc<Self>,
-        user_id: i64,
-        chat_id: i64,
+        ctx: &Ctx,
         service: &str,
         direction: &str,
         order: u32,
         bus: Option<String>,
     ) {
+        let (user_id, chat_id) = (ctx.user_id, ctx.chat_id);
         if self.store.get(user_id).watch.is_some() {
             self.stop_watch(user_id, "已被新的盯车任务替换。").await;
         }
@@ -1461,7 +1596,7 @@ impl App {
         let detail = match self.line_detail(service, direction).await {
             Ok(detail) => detail,
             Err(error) => {
-                self.send(chat_id, &error, Some(inline_keyboard(vec![home_row()])))
+                self.show(ctx, &error, Some(inline_keyboard(vec![home_row()])))
                     .await;
                 return;
             }
@@ -1485,8 +1620,8 @@ impl App {
                 )],
                 home_row(),
             ]);
-            self.send(
-                chat_id,
+            self.show(
+                ctx,
                 &format!(
                     "「{}」当前没有第 {order} 站，线路站点可能已调整，请重新选择上车站。",
                     render::escape(&detail.name)
@@ -1502,6 +1637,7 @@ impl App {
             .city_label
             .unwrap_or_else(|| service.to_string());
 
+        // 盯车卡片独立于主卡片：它每隔几秒自己刷新，不该被导航覆盖
         let card = match self
             .tg
             .send_message(chat_id, "🔔 盯车已启动，正在获取实时数据…", None)
@@ -1529,6 +1665,11 @@ impl App {
         self.store
             .update(user_id, |user| user.watch = Some(spec.clone()));
         self.spawn_watch(user_id, spec);
+
+        // 主卡片回到菜单，避免和盯车卡片显示同一条线路
+        let (text, markup) = self.home_view(user_id);
+        self.show(ctx, &format!("🔔 盯车已启动，见下方卡片。\n\n{text}"), Some(markup))
+            .await;
     }
 
     fn settings_view(&self, user_id: i64) -> (String, Value) {
@@ -1836,6 +1977,14 @@ impl App {
     }
 }
 
+/// 这条更新属于哪个用户；拿不到就不处理（例如频道消息）。
+fn update_actor(update: &Update) -> Option<i64> {
+    if let Some(message) = &update.message {
+        return Some(message.from.as_ref().map_or(message.chat.id, |from| from.id));
+    }
+    update.callback_query.as_ref().map(|callback| callback.from.id)
+}
+
 fn home_row() -> Vec<(String, String)> {
     vec![("🏠 主菜单".into(), "m:home".into())]
 }
@@ -1875,9 +2024,9 @@ const HELP_TEXT: &str = "🚏 <b>WhereBus 使用说明</b>\n\n\
 <b>盯车</b>（/watch）：选好线路与上车站后，可以指定等某一辆车，或跟随「最近的一班」。\
 默认在目标车还差 1 站时提醒一次，进入 500 米后每 60 秒重复提醒，每 10 秒刷新一次卡片；\
 这些都能在 /settings 里改。车进站或已驶过时自动结束。\n\n\
-/app 打开「我的面板」（Mini App）：管理城市、收藏、提醒偏好，也能直接开始车次监控。\n\n\
+所有界面都在同一张卡片上就地更新，不会越点越多；盯车卡片和到站提醒是单独的消息。\n\n\
 数据来自公开的第三方公交数据源，没有任何模拟数据；上游异常时会如实提示。\n\
-你的城市选择、收藏和查询统计保存在运行机器人的服务器本地文件中，/cancel 可取消当前输入。";
+你的城市选择、收藏和查询统计保存在运行机器人的服务器上，/cancel 可取消当前输入。";
 
 #[cfg(test)]
 mod tests {
@@ -1917,6 +2066,75 @@ mod tests {
             table.put(Action::NearbyHere);
         }
         assert_eq!(table.get(&first), None, "最旧的 token 应被淘汰");
+    }
+
+    #[test]
+    fn duplicate_updates_are_ignored() {
+        let seen = SeenUpdates::default();
+        assert!(seen.accept(7));
+        // Telegram 重发同一条更新时不再执行第二次
+        assert!(!seen.accept(7));
+        assert!(seen.accept(8));
+
+        // 窗口滚动后，很久以前的 id 允许再次进入（正常使用中不会复用 id）
+        for id in 100..(100 + MAX_SEEN_UPDATES as i64) {
+            seen.accept(id);
+        }
+        assert!(seen.accept(7));
+    }
+
+    #[test]
+    fn only_the_latest_interaction_renders() {
+        let epochs = Epochs::default();
+        let first = epochs.begin(42);
+        assert!(epochs.is_current(42, first));
+
+        // 用户又点了一次：先发起的那次不再有权覆盖界面
+        let second = epochs.begin(42);
+        assert!(!epochs.is_current(42, first));
+        assert!(epochs.is_current(42, second));
+
+        // 不同用户互不影响
+        let other = epochs.begin(7);
+        assert!(epochs.is_current(7, other));
+        assert!(epochs.is_current(42, second));
+        assert!(!epochs.is_current(7, second + 10));
+    }
+
+    #[test]
+    fn update_actor_reads_the_acting_user() {
+        let message: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {"message_id": 5, "chat": {"id": 42, "type": "private"},
+                        "from": {"id": 7, "first_name": "A"}, "text": "/start"}
+        }))
+        .unwrap();
+        assert_eq!(update_actor(&message), Some(7));
+
+        let callback: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 2,
+            "callback_query": {"id": "c", "from": {"id": 9, "first_name": "B"}, "data": "m:home"}
+        }))
+        .unwrap();
+        assert_eq!(update_actor(&callback), Some(9));
+
+        let empty: Update = serde_json::from_value(serde_json::json!({"update_id": 3})).unwrap();
+        assert_eq!(update_actor(&empty), None);
+    }
+
+    #[test]
+    fn navigation_never_overwrites_the_watch_card() {
+        // 点主卡片上的按钮：就地更新这张卡片
+        assert_eq!(card_target(Some(10), Some(10), None), Some(10));
+        // 点的是另一张旧卡片：那张变成主卡片
+        assert_eq!(card_target(Some(11), Some(10), None), Some(11));
+        // 点的是盯车卡片上的按钮（例如「提醒设置」）：渲染到主卡片
+        assert_eq!(card_target(Some(99), Some(10), Some(99)), Some(10));
+        // 文本命令没有来源消息：用主卡片
+        assert_eq!(card_target(None, Some(10), None), Some(10));
+        // 主卡片正好是盯车卡片，或还没有卡片：返回 None，由调用方新发一条
+        assert_eq!(card_target(None, Some(99), Some(99)), None);
+        assert_eq!(card_target(None, None, None), None);
     }
 
     #[test]

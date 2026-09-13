@@ -241,6 +241,15 @@ impl Telegram {
         self.call("editMessageText", body).await
     }
 
+    /// 删除一条消息（用于清理请求位置的临时提示）。
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> TgResult<Value> {
+        self.call(
+            "deleteMessage",
+            json!({"chat_id": chat_id, "message_id": message_id}),
+        )
+        .await
+    }
+
     pub async fn answer_callback_query(&self, id: &str, text: &str, alert: bool) -> TgResult<Value> {
         self.call(
             "answerCallbackQuery",
@@ -263,21 +272,6 @@ impl Telegram {
                 "parse_mode": "HTML",
                 "disable_web_page_preview": true,
                 "disable_notification": false,
-            }),
-        )
-        .await
-    }
-
-    /// 把聊天窗口的菜单按钮设成打开 Mini App。
-    pub async fn set_chat_menu_button(&self, url: &str, text: &str) -> TgResult<Value> {
-        self.call(
-            "setChatMenuButton",
-            json!({
-                "menu_button": {
-                    "type": "web_app",
-                    "text": text,
-                    "web_app": { "url": url },
-                }
             }),
         )
         .await
@@ -319,21 +313,6 @@ pub fn inline_keyboard(rows: Vec<Vec<(String, String)>>) -> Value {
     json!({ "inline_keyboard": rows })
 }
 
-/// 打开 Mini App 的按钮（URL 必须是 HTTPS）。
-pub fn web_app_button(text: &str, url: &str) -> Value {
-    json!({"text": text, "web_app": {"url": url}})
-}
-
-/// 已经构造好的按钮对象组成的行内键盘。
-pub fn keyboard(rows: Vec<Vec<Value>>) -> Value {
-    json!({ "inline_keyboard": rows })
-}
-
-/// 把 (文案, callback_data) 转成按钮对象，便于与 [`web_app_button`] 混排。
-pub fn callback_button(text: impl Into<String>, data: impl Into<String>) -> Value {
-    json!({"text": text.into(), "callback_data": data.into()})
-}
-
 /// 请求用户共享位置的普通键盘（仅私聊可用）。
 pub fn location_keyboard() -> Value {
     json!({
@@ -341,10 +320,6 @@ pub fn location_keyboard() -> Value {
         "resize_keyboard": true,
         "one_time_keyboard": true,
     })
-}
-
-pub fn remove_keyboard() -> Value {
-    json!({ "remove_keyboard": true })
 }
 
 #[cfg(test)]

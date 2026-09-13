@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode, header},
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -16,8 +16,42 @@ use serde_json::{Value, json};
 
 use crate::bot::app::App;
 use crate::bot::auth::{AdminSessions, hash_password, verify_password};
-use crate::bot::miniapp::{ApiError, ApiResult, alerts_json};
-use crate::bot::store::{AlertField, Store, now_secs};
+use crate::bot::store::{AlertField, AlertSettings, Store, now_secs};
+
+struct ApiError(StatusCode, String);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({"error": self.1}))).into_response()
+    }
+}
+
+type ApiResult = Result<Json<Value>, ApiError>;
+
+/// 提醒设置的取值与可调范围，前端据此渲染 ➖ ➕。
+fn alerts_json(alerts: &AlertSettings, using_defaults: bool) -> Value {
+    json!({
+        "using_defaults": using_defaults,
+        "values": {
+            "poll_secs": alerts.poll_secs,
+            "alert_stations": alerts.alert_stations,
+            "alert_distance_m": alerts.alert_distance_m,
+            "repeat_secs": alerts.repeat_secs,
+            "max_minutes": alerts.max_minutes,
+        },
+        "fields": AlertField::ALL.map(|field| {
+            let (min, max) = field.range();
+            json!({
+                "key": field.key(),
+                "label": field.label(),
+                "unit": field.unit(),
+                "step": field.step(),
+                "min": min,
+                "max": max,
+            })
+        }).to_vec(),
+    })
+}
 
 /// 口令哈希在 meta 表里的键。
 const PASSWORD_KEY: &str = "admin_password";
@@ -295,7 +329,6 @@ async fn user_action(
                 .store
                 .update(body.user_id, |user| user.banned = true);
             if let Some(bot) = &console.bot {
-                bot.sessions().revoke_user(body.user_id);
                 bot.stop_watch(body.user_id, "账号已被管理员停用。").await;
             }
         }
@@ -318,7 +351,6 @@ async fn user_action(
             if let Some(bot) = &console.bot {
                 bot.stop_watch(body.user_id, "账号数据已删除，盯车结束。")
                     .await;
-                bot.sessions().revoke_user(body.user_id);
             }
             console.store.remove(body.user_id);
         }
