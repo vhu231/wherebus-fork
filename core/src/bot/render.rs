@@ -69,7 +69,8 @@ pub fn stop_status_note(status: StopStatus) -> Option<&'static str> {
     }
 }
 
-/// 单辆车的可读描述，逻辑与 `web/bus-view.js` 的 describeBus 保持一致。
+/// 单辆车的可读描述，站点与状态判断与 `web/bus-view.js` 的 describeBus 一致；
+/// 距离部分改用车辆到上车站的直线距离（见 [`crate::bot::watch::distance_to_target`]）。
 #[derive(Debug, Clone)]
 pub struct BusView {
     pub identity: String,
@@ -133,8 +134,9 @@ pub fn describe_bus(
                 format!("约 {} 分钟", seconds.div_ceil(60))
             });
         }
-        if let Some(distance) = bus.distance_to_station {
-            parts.push(format!("距目标 {:.0} 米", distance));
+        // 用车辆与上车站的坐标自己算：上游那个距离是到下一站的，容易误解
+        if let Some(distance) = crate::bot::watch::distance_to_target(bus, stops, target_order) {
+            parts.push(format!("直线 {distance} 米"));
         }
         if parts.is_empty() {
             "暂无该车到站预估".to_string()
@@ -309,7 +311,7 @@ pub fn watch_card(
                 parts.push(format!("约 {minutes} 分钟"));
             }
             if let Some(distance) = approach.distance_m {
-                parts.push(format!("{distance} 米"));
+                parts.push(format!("直线 {distance} 米"));
             }
             if parts.is_empty() {
                 text.push_str("   上游没有给出到站预估\n");
@@ -323,7 +325,7 @@ pub fn watch_card(
     }
 
     text.push_str(&format!(
-        "\n提醒规则：还有 {} 站时提醒一次；{} 米内每 {} 秒重复提醒\n每 {} 秒刷新 · 更新于 {}",
+        "\n提醒规则：还有 {} 站时提醒一次；直线 {} 米内每 {} 秒重复提醒\n每 {} 秒刷新 · 更新于 {}",
         alerts.alert_stations, alerts.alert_distance_m, alerts.repeat_secs, alerts.poll_secs, clock,
     ));
     text

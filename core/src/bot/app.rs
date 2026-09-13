@@ -1548,7 +1548,7 @@ impl App {
             .unwrap_or_else(|| format!("第 {order} 站"));
 
         let mut text = format!(
-            "🔔 <b>盯车</b>\n{} · 上车站「{}」\n\n选择你要等的车：\n",
+            "🔔 <b>盯车</b>\n{} · 上车站「{}」\n\n选择你要等的车（由近到远）：\n",
             render::escape(&detail.name),
             render::escape(&station_name),
         );
@@ -1562,7 +1562,12 @@ impl App {
             }),
         )]];
 
-        for (index, bus) in realtime.buses.iter().enumerate() {
+        // 由近到远排序；保留原始下标，没有车牌时的「车辆 N」编号才不会跳
+        let mut candidates: Vec<(usize, &crate::models::BusPosition)> =
+            realtime.buses.iter().enumerate().collect();
+        candidates.sort_by_key(|(_, bus)| watch::proximity_key(bus, stops, order));
+
+        for (index, bus) in candidates {
             let view = render::describe_bus(bus, index, stops, order);
             if view.passed {
                 continue;

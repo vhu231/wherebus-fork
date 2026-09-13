@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 use crate::bot::app::App;
 use crate::bot::render;
 use crate::bot::store::{AlertSettings, WatchSpec, now_secs};
-use crate::models::{LineStop, RealTimeData};
+use crate::models::{BusPosition, LineStop, RealTimeData};
 
 /// 连续多少轮取不到数据就结束盯车，避免无意义地一直打上游。
 const MAX_CONSECUTIVE_ERRORS: u32 = 6;
@@ -47,7 +47,7 @@ pub fn locate(
             location: Some(view.location),
             stations_away,
             minutes_away: bus.travel_time_secs.map(|secs| secs.div_ceil(60)),
-            distance_m: bus.distance_to_station.map(|meters| meters.max(0.0) as u32),
+            distance_m: distance_to_target(bus, stops, order),
             passed,
             at_target,
             anonymous: false,
@@ -71,13 +71,7 @@ pub fn locate(
             let (_, passed, _) = progress(bus.station_index, bus.is_arriving, stops, order);
             !passed
         })
-        .min_by_key(|(_, bus)| {
-            let (stations_away, _, _) = progress(bus.station_index, bus.is_arriving, stops, order);
-            (
-                stations_away.unwrap_or(u32::MAX),
-                bus.travel_time_secs.unwrap_or(u32::MAX),
-            )
-        })
+        .min_by_key(|(_, bus)| proximity_key(bus, stops, order))
         .map(|(index, _)| index);
 
     if let Some(index) = nearest {
@@ -99,6 +93,44 @@ pub fn locate(
             at_target: estimate.stations_away == 0,
             anonymous: true,
         })
+}
+
+/// 车辆到**上车站**的直线距离（米）。
+///
+/// 上游给的 `distance_to_station` 语义并不统一：实测掌上公交返回的是车辆到
+/// 下一站的距离，二十多站开外的车也只有两三百米，直接拿来做「500 米内提醒」
+/// 会对任何一辆车立刻触发。所以这里用车辆与上车站的经纬度自己算；
+/// 缺少坐标时返回 None，宁可不提醒也不报一个错的距离。
+pub fn distance_to_target(bus: &BusPosition, stops: &[LineStop], order: u32) -> Option<u32> {
+    let stop = stops.iter().find(|stop| stop.order == order)?;
+    let (lat, lng) = (bus.lat?, bus.lng?);
+    if !valid_point(lat, lng) || !valid_point(stop.lat, stop.lng) {
+        return None;
+    }
+    Some(crate::support::coord::haversine_distance_m(lat, lng, stop.lat, stop.lng).round() as u32)
+}
+
+/// 0/0 与超范围的坐标都是上游缺数据时的占位值。
+fn valid_point(lat: f64, lng: f64) -> bool {
+    lat.is_finite()
+        && lng.is_finite()
+        && (lat != 0.0 || lng != 0.0)
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lng)
+}
+
+/// 由近到远的排序键：先看还差几站，再看上游给的预计时间与直线距离。
+/// 位置在线路上对不上的车（站序匹配不到）排在最后。
+///
+/// 列表展示与「最近的一班」的自动跟随共用这个标准，
+/// 这样列表里的第一辆就是自动模式会跟的那辆。
+pub fn proximity_key(bus: &BusPosition, stops: &[LineStop], order: u32) -> (u32, u32, u32) {
+    let (stations_away, _, _) = progress(bus.station_index, bus.is_arriving, stops, order);
+    (
+        stations_away.unwrap_or(u32::MAX),
+        bus.travel_time_secs.unwrap_or(u32::MAX),
+        distance_to_target(bus, stops, order).unwrap_or(u32::MAX),
+    )
 }
 
 /// 车辆相对上车站的站数差与状态。
@@ -194,7 +226,7 @@ pub fn alert_text(alert: Alert, spec: &WatchSpec, approach: &Approach) -> String
             parts.push(format!("约 {minutes} 分钟"));
         }
         if let Some(distance) = approach.distance_m {
-            parts.push(format!("{distance} 米"));
+            parts.push(format!("直线 {distance} 米"));
         }
         parts.join(" · ")
     };
@@ -203,7 +235,7 @@ pub fn alert_text(alert: Alert, spec: &WatchSpec, approach: &Approach) -> String
             "🔔 <b>{line}</b> 还有 {stations} 站到「{station}」\n{who}\n{detail}\n\n准备上车。"
         ),
         Alert::Distance(distance) => format!(
-            "🔔 <b>{line}</b> 距离「{station}」只剩 {distance} 米\n{who}\n{detail}"
+            "🔔 <b>{line}</b> 距离「{station}」直线只剩 {distance} 米\n{who}\n{detail}"
         ),
         Alert::Arriving => {
             format!("🚏 <b>{line}</b> 正在进站「{station}」\n{who}\n\n盯车结束。")
@@ -288,7 +320,7 @@ pub async fn run(app: Arc<App>, user_id: i64, spec: WatchSpec) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ArrivalDetail, BusPosition, CrowdLevel, RunState, StopStatus};
+    use crate::models::{ArrivalDetail, CrowdLevel, RunState, StopStatus};
 
     fn stops() -> Vec<LineStop> {
         (1..=6)
@@ -342,7 +374,8 @@ mod tests {
         let found = locate(&data, &stops(), 5, Some("B")).unwrap();
         assert_eq!(found.label, "车辆 B");
         assert_eq!(found.stations_away, Some(3));
-        assert_eq!(found.distance_m, Some(2400));
+        // 没有坐标就没有距离：上游那个字段是到下一站的，不能当成到上车站
+        assert_eq!(found.distance_m, None);
         assert!(!found.passed);
         // 指定的车还没出现在实时数据里
         assert!(locate(&data, &stops(), 5, Some("C")).is_none());
@@ -361,6 +394,56 @@ mod tests {
         let found = locate(&data, &stops(), 5, None).unwrap();
         assert_eq!(found.label, "车辆 近");
         assert_eq!(found.stations_away, Some(2));
+    }
+
+    #[test]
+    fn distance_is_measured_to_the_boarding_stop() {
+        let mut stops = stops();
+        // 上车站放在一个具体坐标上
+        stops[4].lat = 24.8740;
+        stops[4].lng = 118.6760;
+
+        let mut near = bus("近", 4, false, Some(9999.0));
+        near.lat = Some(24.8745);
+        near.lng = Some(118.6762);
+        let distance = distance_to_target(&near, &stops, 5).unwrap();
+        // 约 60 米，与上游给的 9999 无关
+        assert!((40..90).contains(&distance), "实际 {distance} 米");
+
+        // 缺坐标、或坐标是 0/0 占位值时不猜距离
+        let mut blank = bus("无坐标", 4, false, Some(120.0));
+        blank.lat = None;
+        blank.lng = None;
+        assert_eq!(distance_to_target(&blank, &stops, 5), None);
+        let mut zero = bus("零坐标", 4, false, Some(120.0));
+        zero.lat = Some(0.0);
+        zero.lng = Some(0.0);
+        assert_eq!(distance_to_target(&zero, &stops, 5), None);
+        // 站点没有坐标时同样不猜
+        assert_eq!(distance_to_target(&near, &stops, 1), None);
+    }
+
+    #[test]
+    fn buses_sort_from_nearest_to_farthest() {
+        let stops = stops();
+        let mut buses = vec![
+            bus("远", 1, false, Some(3000.0)),
+            bus("位置对不上", 99, false, Some(0.0)),
+            bus("近", 4, false, Some(200.0)),
+            bus("中", 3, false, Some(900.0)),
+        ];
+        buses.sort_by_key(|bus| proximity_key(bus, &stops, 5));
+        let order: Vec<&str> = buses.iter().map(|bus| bus.bus_id.as_str()).collect();
+        // 站序对不上的排最后，不会因为上游给的 0 米而排到最前
+        assert_eq!(order, vec!["近", "中", "远", "位置对不上"]);
+
+        // 站数相同时看预计时间，再看距离
+        let mut same_stop = vec![
+            BusPosition { travel_time_secs: Some(600), ..bus("慢", 3, false, Some(800.0)) },
+            BusPosition { travel_time_secs: Some(120), ..bus("快", 3, false, Some(900.0)) },
+        ];
+        same_stop.sort_by_key(|bus| proximity_key(bus, &stops, 5));
+        assert_eq!(same_stop[0].bus_id, "快");
     }
 
     #[test]
