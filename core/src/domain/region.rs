@@ -1,5 +1,8 @@
 macro_rules! cities {
     ($($variant:ident => ($name:expr, $province:expr)),+ $(,)?) => {
+        /// 城市表按行政区划保持完整，具体哪些能查取决于 provider 覆盖到哪些，
+        /// 因此会有一些暂时用不到的取值。
+        #[allow(dead_code)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum City {
             $($variant),+
@@ -18,8 +21,6 @@ macro_rules! cities {
                 }
             }
         }
-
-        pub const ALL_CITIES: &[City] = &[$(City::$variant),+];
     };
 }
 

@@ -11,15 +11,13 @@ use raw::NearbyResponse;
 
 pub struct ChelaileProvider {
     client: ChelaileClient,
-    city_display: String,
     cached_nearby: Mutex<Option<NearbyResponse>>,
 }
 
 impl ChelaileProvider {
-    pub fn new(city_id: &str, display_name: &str) -> Result<Self, ProviderError> {
+    pub fn new(city_id: &str) -> Result<Self, ProviderError> {
         Ok(Self {
             client: ChelaileClient::new(city_id)?,
-            city_display: display_name.to_string(),
             cached_nearby: Mutex::new(None),
         })
     }
@@ -137,13 +135,6 @@ fn infer_realtime_run_state(resp: &raw::LineDetailResponse) -> RunState {
 
 #[async_trait]
 impl BusDataProvider for ChelaileProvider {
-    fn provider_name(&self) -> &str {
-        "车来了"
-    }
-    fn city_name(&self) -> &str {
-        &self.city_display
-    }
-
     async fn nearby_stations(&self, lat: f64, lng: f64) -> Result<Vec<Station>, ProviderError> {
         let resp = self.client.nearby_lines(lat, lng).await?;
         let stations = resp

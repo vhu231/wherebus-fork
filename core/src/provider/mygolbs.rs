@@ -10,23 +10,21 @@ use raw::CityConfig;
 
 pub struct MygolbsProvider {
     client: GolbsClient,
-    city_display: String,
 }
 
 impl MygolbsProvider {
-    pub fn new(city_name: &str, city_key: &str, display_name: &str) -> Result<Self, ProviderError> {
+    pub fn new(city_name: &str, city_key: &str) -> Result<Self, ProviderError> {
         let config = CityConfig {
             name: city_name.to_string(),
             key: city_key.to_string(),
         };
         Ok(Self {
             client: GolbsClient::new(config)?,
-            city_display: display_name.to_string(),
         })
     }
 
     pub fn from_city(city: &cities::MygolbsCity) -> Result<Self, ProviderError> {
-        Self::new(city.api_city_name, city.api_city_key, city.city.name())
+        Self::new(city.api_city_name, city.api_city_key)
     }
 
     fn parse_direction_id(key: &str) -> (String, String) {
@@ -227,13 +225,6 @@ fn congestion_from_color(color: &str) -> CongestionLevel {
 
 #[async_trait]
 impl BusDataProvider for MygolbsProvider {
-    fn provider_name(&self) -> &str {
-        "掌上公交"
-    }
-    fn city_name(&self) -> &str {
-        &self.city_display
-    }
-
     async fn nearby_stations(&self, lat: f64, lng: f64) -> Result<Vec<Station>, ProviderError> {
         let resp = self.client.nearby_stations(lat, lng).await?;
         Ok(resp

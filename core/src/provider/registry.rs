@@ -57,7 +57,7 @@ pub fn create_provider(service_id: &str) -> Arc<dyn BusDataProvider> {
         .iter()
         .find(|city| city.city_id == service_id)
     {
-        let inner = chelaile::ChelaileProvider::new(city.city_id, city.city.name()).unwrap();
+        let inner = chelaile::ChelaileProvider::new(city.city_id).unwrap();
         return Arc::new(inner);
     }
 
@@ -76,13 +76,6 @@ struct NullProvider;
 
 #[async_trait]
 impl BusDataProvider for NullProvider {
-    fn provider_name(&self) -> &str {
-        ""
-    }
-    fn city_name(&self) -> &str {
-        ""
-    }
-
     async fn nearby_stations(&self, _lat: f64, _lng: f64) -> Result<Vec<Station>, ProviderError> {
         Ok(vec![])
     }

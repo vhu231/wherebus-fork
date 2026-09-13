@@ -32,9 +32,6 @@ impl std::error::Error for ProviderError {}
 
 #[async_trait]
 pub(crate) trait BusDataProvider: Send + Sync {
-    fn provider_name(&self) -> &str;
-    fn city_name(&self) -> &str;
-
     async fn nearby_stations(&self, lat: f64, lng: f64) -> Result<Vec<Station>, ProviderError>;
     async fn station_lines(
         &self,

@@ -824,13 +824,6 @@ impl DebugProvider {
 
 #[async_trait]
 impl BusDataProvider for DebugProvider {
-    fn provider_name(&self) -> &str {
-        "Debug"
-    }
-    fn city_name(&self) -> &str {
-        "北京"
-    }
-
     async fn nearby_stations(&self, lat: f64, lng: f64) -> Result<Vec<Station>, ProviderError> {
         let mut rng = Rng::from_time();
         let mut stations = Vec::new();
