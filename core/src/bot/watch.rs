@@ -22,7 +22,10 @@ pub struct Approach {
     pub location: Option<String>,
     pub stations_away: Option<u32>,
     pub minutes_away: Option<u32>,
+    /// 到上车站的直线距离（自己按坐标算）
     pub distance_m: Option<u32>,
+    /// 车辆正开往的下一站，以及上游给的剩余米数（0 表示已到那一站）
+    pub next_stop: Option<(String, u32)>,
     /// 已经驶过上车站
     pub passed: bool,
     /// 正在进上车站
@@ -41,15 +44,18 @@ pub fn locate(
     let describe = |index: usize| -> Approach {
         let bus = &realtime.buses[index];
         let view = render::describe_bus(bus, index, stops, order);
-        let (stations_away, passed, at_target) = progress(bus.station_index, bus.is_arriving, stops, order);
+        let (stations_away, passed, at_target) =
+            progress(bus.station_index, bus.is_arriving, stops, order);
         Approach {
             label: view.identity,
             location: Some(view.location),
             stations_away,
             minutes_away: bus.travel_time_secs.map(|secs| secs.div_ceil(60)),
             distance_m: distance_to_target(bus, stops, order),
+            next_stop: next_stop(bus, stops).map(|(stop, meters)| (stop.name.clone(), meters)),
             passed,
-            at_target,
+            // 距离归零且下一站就是上车站 —— 车到了
+            at_target: at_target || arrived_at_target(bus, stops, order),
             anonymous: false,
         }
     };
@@ -89,10 +95,39 @@ pub fn locate(
             stations_away: Some(estimate.stations_away),
             minutes_away: Some(estimate.minutes_away),
             distance_m: Some(estimate.distance_m),
+            next_stop: None,
             passed: false,
             at_target: estimate.stations_away == 0,
             anonymous: true,
         })
+}
+
+/// 车辆正开往的那一站，以及上游给的「到这一站还有多少米」。
+///
+/// 上游的 `distance_to_station` 是到车辆**下一个停靠站**的距离：实测它会随着
+/// 行驶递减到 0（到站），过站后又跳回大数。所以必须连同是哪一站一起展示，
+/// 不能当成「距你的上车站」。
+pub fn next_stop<'a>(bus: &BusPosition, stops: &'a [LineStop]) -> Option<(&'a LineStop, u32)> {
+    let position = stops.iter().position(|stop| stop.order == bus.station_index)?;
+    // 正在进站时开往的就是当前这一站；已离站则是下一站
+    let heading = if bus.is_arriving {
+        stops.get(position)
+    } else {
+        stops.get(position + 1)
+    }?;
+    let meters = bus.distance_to_station?.max(0.0).round() as u32;
+    Some((heading, meters))
+}
+
+/// 车已经到上车站了吗。
+///
+/// 上游距离归零表示车到了它正开往的那一站；如果那一站正是上车站，
+/// 说明车已经到你这里了——此时 `is_arriving` 可能还是「已离站」，不能只看标记。
+pub fn arrived_at_target(bus: &BusPosition, stops: &[LineStop], order: u32) -> bool {
+    match next_stop(bus, stops) {
+        Some((heading, 0)) => heading.order == order,
+        _ => false,
+    }
 }
 
 /// 车辆到**上车站**的直线距离（米）。
@@ -225,8 +260,15 @@ pub fn alert_text(alert: Alert, spec: &WatchSpec, approach: &Approach) -> String
         if let Some(minutes) = approach.minutes_away {
             parts.push(format!("约 {minutes} 分钟"));
         }
+        match &approach.next_stop {
+            Some((name, 0)) => parts.push(format!("已到站「{}」", render::escape(name))),
+            Some((name, meters)) => {
+                parts.push(format!("距下一站「{}」{meters} 米", render::escape(name)))
+            }
+            None => {}
+        }
         if let Some(distance) = approach.distance_m {
-            parts.push(format!("直线 {distance} 米"));
+            parts.push(format!("到上车站直线 {distance} 米"));
         }
         parts.join(" · ")
     };
@@ -235,10 +277,10 @@ pub fn alert_text(alert: Alert, spec: &WatchSpec, approach: &Approach) -> String
             "🔔 <b>{line}</b> 还有 {stations} 站到「{station}」\n{who}\n{detail}\n\n准备上车。"
         ),
         Alert::Distance(distance) => format!(
-            "🔔 <b>{line}</b> 距离「{station}」直线只剩 {distance} 米\n{who}\n{detail}"
+            "🔔 <b>{line}</b> 距「{station}」直线只剩 {distance} 米\n{who}\n{detail}"
         ),
         Alert::Arriving => {
-            format!("🚏 <b>{line}</b> 正在进站「{station}」\n{who}\n\n盯车结束。")
+            format!("🚏 <b>{line}</b> 到站了：「{station}」\n{who}\n\n车来了，盯车结束。")
         }
         Alert::Passed => format!(
             "⚪️ <b>{line}</b> 已驶过「{station}」\n{who}\n\n盯车结束，需要的话再开一次。"
@@ -397,6 +439,52 @@ mod tests {
     }
 
     #[test]
+    fn zero_distance_to_the_boarding_stop_means_the_bus_arrived() {
+        let stops = stops();
+        // 已离开上一站、下一站就是上车站、上游距离归零 → 车已经到了
+        let mut at_stop = bus("到了", 4, false, Some(0.0));
+        at_stop.travel_time_secs = None;
+        assert!(arrived_at_target(&at_stop, &stops, 5));
+        let approach = locate(&realtime(vec![at_stop], vec![]), &stops, 5, None).unwrap();
+        assert!(approach.at_target);
+        assert_eq!(
+            decide_alert(&approach, &AlertSettings::default(), &AlertState::default(), 0),
+            Some(Alert::Arriving)
+        );
+
+        // 正在进上一站、距离归零：车在上一站，不是在你这站
+        let previous = bus("在上一站", 4, true, Some(0.0));
+        assert!(!arrived_at_target(&previous, &stops, 5));
+        // 还有距离就还没到
+        let close = bus("快到了", 4, false, Some(30.0));
+        assert!(!arrived_at_target(&close, &stops, 5));
+        // 下一站不是上车站时，归零只说明它到了别的站
+        let elsewhere = bus("到了别的站", 2, false, Some(0.0));
+        assert!(!arrived_at_target(&elsewhere, &stops, 5));
+    }
+
+    #[test]
+    fn next_stop_reports_where_the_bus_is_heading() {
+        let stops = stops();
+        // 已离开第 3 站 → 正开往第 4 站
+        let departed = bus("A", 3, false, Some(420.0));
+        let (heading, meters) = next_stop(&departed, &stops).unwrap();
+        assert_eq!(heading.order, 4);
+        assert_eq!(meters, 420);
+
+        // 正在进第 3 站 → 开往的就是第 3 站
+        let arriving = bus("B", 3, true, Some(15.0));
+        let (heading, meters) = next_stop(&arriving, &stops).unwrap();
+        assert_eq!(heading.order, 3);
+        assert_eq!(meters, 15);
+
+        // 上游没给距离就不猜
+        let mut unknown = bus("C", 3, false, None);
+        unknown.distance_to_station = None;
+        assert!(next_stop(&unknown, &stops).is_none());
+    }
+
+    #[test]
     fn distance_is_measured_to_the_boarding_stop() {
         let mut stops = stops();
         // 上车站放在一个具体坐标上
@@ -471,6 +559,7 @@ mod tests {
             stations_away: stations,
             minutes_away: None,
             distance_m: distance,
+            next_stop: None,
             passed: false,
             at_target: false,
             anonymous: false,
@@ -549,5 +638,23 @@ mod tests {
         assert!(text.contains("1路"));
         assert!(text.contains("运河天地"));
         assert!(text.contains("420 米"));
+
+        // 提醒里标明车正开往哪一站、还有多少米
+        let heading = Approach {
+            next_stop: Some(("普明村".into(), 458)),
+            ..approach(Some(1), Some(512))
+        };
+        let text = alert_text(Alert::Distance(512), &spec, &heading);
+        assert!(text.contains("距下一站「普明村」458 米"), "实际：{text}");
+        assert!(text.contains("到上车站直线 512 米"), "实际：{text}");
+
+        // 到站时直说车来了
+        let arrived = Approach {
+            next_stop: Some(("运河天地".into(), 0)),
+            at_target: true,
+            ..approach(Some(0), Some(0))
+        };
+        let text = alert_text(Alert::Arriving, &spec, &arrived);
+        assert!(text.contains("到站了"), "实际：{text}");
     }
 }

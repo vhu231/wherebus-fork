@@ -99,7 +99,10 @@ pub fn describe_bus(
         }
         _ => false,
     };
-    let at_target = matches!((position, target_position), (Some(a), Some(b)) if a == b) && bus.is_arriving;
+    // 上游距离归零且下一站就是上车站时，车其实已经到了（标记可能还是「已离站」）
+    let at_target = (matches!((position, target_position), (Some(a), Some(b)) if a == b)
+        && bus.is_arriving)
+        || crate::bot::watch::arrived_at_target(bus, stops, target_order);
 
     let identity = if bus.bus_id.trim().is_empty() {
         format!("车辆 {}（上游未提供编号）", index + 1)
@@ -134,9 +137,17 @@ pub fn describe_bus(
                 format!("约 {} 分钟", seconds.div_ceil(60))
             });
         }
-        // 用车辆与上车站的坐标自己算：上游那个距离是到下一站的，容易误解
+        // 上游给的距离是「到下一个停靠站」的，标明是哪一站，避免被当成到上车站
+        match crate::bot::watch::next_stop(bus, stops) {
+            Some((heading, 0)) => parts.push(format!("已到站「{}」", heading.name)),
+            Some((heading, meters)) => {
+                parts.push(format!("距下一站「{}」{meters} 米", heading.name))
+            }
+            None => {}
+        }
+        // 到上车站的距离用坐标自己算
         if let Some(distance) = crate::bot::watch::distance_to_target(bus, stops, target_order) {
-            parts.push(format!("直线 {distance} 米"));
+            parts.push(format!("到上车站直线 {distance} 米"));
         }
         if parts.is_empty() {
             "暂无该车到站预估".to_string()
@@ -310,8 +321,16 @@ pub fn watch_card(
             if let Some(minutes) = approach.minutes_away {
                 parts.push(format!("约 {minutes} 分钟"));
             }
+            // 上游的米数是到车辆下一站的，标明是哪一站
+            match &approach.next_stop {
+                Some((name, 0)) => parts.push(format!("已到站「{}」", escape(name))),
+                Some((name, meters)) => {
+                    parts.push(format!("距下一站「{}」{meters} 米", escape(name)))
+                }
+                None => {}
+            }
             if let Some(distance) = approach.distance_m {
-                parts.push(format!("直线 {distance} 米"));
+                parts.push(format!("到上车站直线 {distance} 米"));
             }
             if parts.is_empty() {
                 text.push_str("   上游没有给出到站预估\n");
@@ -325,7 +344,7 @@ pub fn watch_card(
     }
 
     text.push_str(&format!(
-        "\n提醒规则：还有 {} 站时提醒一次；直线 {} 米内每 {} 秒重复提醒\n每 {} 秒刷新 · 更新于 {}",
+        "\n提醒规则：还有 {} 站时提醒一次；到上车站直线 {} 米内每 {} 秒重复提醒\n每 {} 秒刷新 · 更新于 {}",
         alerts.alert_stations, alerts.alert_distance_m, alerts.repeat_secs, alerts.poll_secs, clock,
     ));
     text
