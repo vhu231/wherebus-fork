@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WhereBus 管理面板</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root { color-scheme: light dark; --bg: var(--tg-theme-bg-color, #fff); --fg: var(--tg-theme-text-color, #111); --muted: var(--tg-theme-hint-color, #777); --card: var(--tg-theme-secondary-bg-color, #f3f4f6); --accent: var(--tg-theme-button-color, #2f80ed); --accent-fg: var(--tg-theme-button-text-color, #fff); --danger: #d64545; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 12px 12px 40px; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif; background: var(--bg); color: var(--fg); }
+h1 { font-size: 18px; margin: 4px 0 2px; }
+h2 { font-size: 15px; margin: 18px 0 8px; }
+.muted { color: var(--muted); font-size: 13px; }
+.error { color: var(--danger); }
+.card { background: var(--card); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.row + .row { margin-top: 10px; }
+button { font: inherit; border: 0; border-radius: 8px; padding: 7px 12px; background: var(--accent); color: var(--accent-fg); cursor: pointer; }
+button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+button.danger { background: var(--danger); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+.stepper { display: flex; align-items: center; gap: 8px; }
+.stepper output { min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; gap: 8px; margin: 10px 0; }
+.tabs button { flex: 1; background: var(--card); color: var(--fg); }
+.tabs button[aria-selected="true"] { background: var(--accent); color: var(--accent-fg); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid rgba(128,128,128,.25); vertical-align: top; }
+.bars { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: 1px; overflow-x: auto; white-space: nowrap; }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--accent); color: var(--accent-fg); font-size: 12px; }
+.pill.off { background: var(--muted); }
+</style>
+</head>
+<body>
+<h1>WhereBus 管理面板</h1>
+<p id="status" class="muted">正在通过 Telegram 登录…</p>
+
+<div class="tabs" id="tabs" hidden>
+  <button id="tab-me" aria-selected="true">我的</button>
+  <button id="tab-admin" aria-selected="false" hidden>Bot 管理</button>
+</div>
+
+<section id="view-me" hidden></section>
+<section id="view-admin" hidden></section>
+
+<script src="/miniapp.js"></script>
+</body>
+</html>

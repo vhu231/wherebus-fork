@@ -5,3 +5,7 @@
 
 .vscode/
 .codacy/
+
+# Telegram 机器人的用户数据
+wherebus-bot-data.json
+wherebus-bot-data.json.tmp
