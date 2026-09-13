@@ -19,7 +19,7 @@ use crate::bot::store::{
     now_secs,
 };
 use crate::bot::telegram::{
-    CallbackQuery, Message, Telegram, Update, inline_keyboard, location_keyboard,
+    CallbackQuery, Message, Telegram, Update, command_keyboard, inline_keyboard,
 };
 use crate::bot::{render, watch};
 use crate::models::{BusRoute, LineDetail, RealTimeData};
@@ -61,6 +61,8 @@ pub(crate) struct Ctx {
     pub epoch: u64,
     /// 触发这次交互的消息（回调来的按钮所在消息）
     pub source: Option<i64>,
+    /// 用户刚发了消息：卡片要重新发到聊天最下方，而不是留在上面被顶走
+    pub fresh: bool,
     /// 交互开始时的盯车卡片；这条消息由盯车循环维护，不能被导航内容覆盖。
     /// 记在上下文里，是因为处理过程中盯车可能已经结束（例如「停止盯车」）。
     pub watch_card: Option<i64>,
@@ -232,8 +234,8 @@ pub struct App {
     cards: Mutex<HashMap<i64, i64>>,
     /// 每个用户的操作序号，用来丢弃被取代的旧渲染
     epochs: Epochs,
-    /// 请求位置时发出的临时消息，收到位置后删除
-    location_prompts: Mutex<HashMap<i64, i64>>,
+    /// 已经发过常驻命令键盘的会话（重启后会再发一次，客户端幂等）
+    keyboards: Mutex<HashSet<i64>>,
     /// 已处理过的 update_id，避免重复投递被执行两次
     seen_updates: SeenUpdates,
     tz_offset: i64,
@@ -281,7 +283,7 @@ pub async fn start(store: Arc<Store>) -> anyhow::Result<Option<Arc<App>>> {
         watches: Mutex::new(HashMap::new()),
         cards: Mutex::new(HashMap::new()),
         epochs: Epochs::default(),
-        location_prompts: Mutex::new(HashMap::new()),
+        keyboards: Mutex::new(HashSet::new()),
         seen_updates: SeenUpdates::default(),
         tz_offset,
         started_at: now_secs(),
@@ -509,6 +511,7 @@ impl App {
             user_id,
             epoch,
             source,
+            fresh: source.is_none(),
             watch_card: self.watch_card_of(user_id),
         }
     }
@@ -531,47 +534,101 @@ impl App {
             .map(|watch| watch.card_message_id)
     }
 
-    /// 把界面渲染到会话的主卡片上：能编辑就原地改，改不动才新发一条。
+    /// 把界面渲染到会话的卡片上。
+    ///
+    /// 点按钮时就地编辑那张卡片；用户发消息后卡片会被自己的消息顶到上面，
+    /// 这时重新发一张到最下方，并删掉旧的，保证「菜单永远在最新位置」。
     pub(crate) async fn show(&self, ctx: &Ctx, text: &str, markup: Option<Value>) {
         if !self.is_current(ctx) {
             return;
         }
-        let watch_card = ctx.watch_card;
-        let target = card_target(ctx.source, self.card_of(ctx.chat_id), watch_card);
-
-        if let Some(target) = target {
-            match self
-                .tg
-                .edit_message_text(ctx.chat_id, target, text, markup.clone())
-                .await
-            {
-                // 内容没变化说明界面已经是这样了，同样算成功
-                Ok(_) => {
-                    self.cards.lock().insert(ctx.chat_id, target);
-                    return;
-                }
-                Err(error) if error.is_not_modified() => {
-                    self.cards.lock().insert(ctx.chat_id, target);
-                    return;
-                }
-                Err(error) => {
-                    eprintln!("[bot] 卡片 {target} 无法编辑（{error}），改为新发一条");
-                }
-            }
+        let existing = self.card_of(ctx.chat_id);
+        if ctx.fresh {
+            self.repost_card(ctx, text, markup, existing).await;
+            return;
         }
 
-        match self.tg.send_message(ctx.chat_id, text, markup).await {
+        let Some(target) = card_target(ctx.source, existing, ctx.watch_card) else {
+            self.repost_card(ctx, text, markup, existing).await;
+            return;
+        };
+        match self
+            .tg
+            .edit_message_text(ctx.chat_id, target, text, markup.clone())
+            .await
+        {
+            // 内容没变化说明界面已经是这样了，同样算成功
+            Ok(_) => {
+                self.cards.lock().insert(ctx.chat_id, target);
+            }
+            Err(error) if error.is_not_modified() => {
+                self.cards.lock().insert(ctx.chat_id, target);
+            }
+            Err(error) => {
+                eprintln!("[bot] 卡片 {target} 无法编辑（{error}），改为新发一条");
+                self.repost_card(ctx, text, markup, existing).await;
+            }
+        }
+    }
+
+    /// 新发一张卡片到最下方，再删掉旧的那张（先发后删，中间不会没有卡片）。
+    async fn repost_card(
+        &self,
+        ctx: &Ctx,
+        text: &str,
+        markup: Option<Value>,
+        previous: Option<i64>,
+    ) {
+        let Some(message_id) = self.send_card(ctx.chat_id, text, markup).await else {
+            return;
+        };
+        self.cards.lock().insert(ctx.chat_id, message_id);
+        // 盯车卡片不归导航管，别误删
+        if let Some(previous) = previous.filter(|id| *id != message_id && Some(*id) != ctx.watch_card)
+        {
+            if self.tg.delete_message(ctx.chat_id, previous).await.is_err() {
+                // 删不掉（超过 48 小时等）就至少让旧卡片不可点
+                let _ = self
+                    .tg
+                    .edit_message_text(ctx.chat_id, previous, "⬇️ 已在下面的新卡片继续", None)
+                    .await;
+            }
+        }
+    }
+
+    /// 发一张新卡片；会话里还没有常驻命令键盘时顺带补上。
+    async fn send_card(&self, chat_id: i64, text: &str, markup: Option<Value>) -> Option<i64> {
+        let needs_keyboard = !self.keyboards.lock().contains(&chat_id);
+        if !needs_keyboard {
+            return match self.tg.send_message(chat_id, text, markup).await {
+                Ok(message) => Some(message.message_id),
+                Err(error) => {
+                    eprintln!("[bot] 发送卡片失败：{error}");
+                    None
+                }
+            };
+        }
+
+        // 一条消息只能带一种键盘：先带常驻键盘发出去，再补上这张卡片的按钮
+        match self
+            .tg
+            .send_message(chat_id, text, Some(command_keyboard()))
+            .await
+        {
             Ok(message) => {
-                let previous = self.cards.lock().insert(ctx.chat_id, message.message_id);
-                // 旧卡片留在聊天记录里会让人点到过期界面，这里让它退役
-                if let Some(previous) = previous.filter(|id| Some(*id) != watch_card) {
+                self.keyboards.lock().insert(chat_id);
+                if markup.is_some() {
                     let _ = self
                         .tg
-                        .edit_message_text(ctx.chat_id, previous, "⬇️ 已在下面的新卡片继续", None)
+                        .edit_message_text(chat_id, message.message_id, text, markup)
                         .await;
                 }
+                Some(message.message_id)
             }
-            Err(error) => eprintln!("[bot] 发送卡片失败：{error}"),
+            Err(error) => {
+                eprintln!("[bot] 发送卡片失败：{error}");
+                None
+            }
         }
     }
 
@@ -655,6 +712,12 @@ impl App {
             return;
         };
 
+        // 常驻键盘的按钮发来的就是这些文案，等同于对应命令
+        if let Some(command) = keyboard_command(text) {
+            self.on_command(&ctx, command, "").await;
+            return;
+        }
+
         if let Some((command, argument)) = parse_command(text) {
             self.on_command(&ctx, &command, &argument).await;
             return;
@@ -687,7 +750,7 @@ impl App {
                 self.store
                     .update(user_id, |user| user.pending = Pending::None);
                 let (text, markup) = self.home_view(user_id);
-                self.show(ctx, &text, Some(markup)).await;
+                self.show(ctx, &text, markup).await;
             }
             "help" => {
                 self.show(ctx, HELP_TEXT, Some(inline_keyboard(vec![home_row()])))
@@ -743,15 +806,15 @@ impl App {
                 self.store
                     .update(user_id, |user| user.pending = Pending::None);
                 let (text, markup) = self.home_view(user_id);
-                self.show(ctx, &format!("已取消当前输入。\n\n{text}"), Some(markup))
+                self.show(ctx, &format!("已取消当前输入。\n\n{text}"), markup)
                     .await;
             }
             _ => {
                 let (text, markup) = self.home_view(user_id);
                 self.show(
                     ctx,
-                    &format!("不认识这个命令，发送 /help 查看用法。\n\n{text}"),
-                    Some(markup),
+                    &format!("不认识这个命令，用下方键盘或发送 /help 查看用法。\n\n{text}"),
+                    markup,
                 )
                 .await;
             }
@@ -764,8 +827,6 @@ impl App {
     }
 
     async fn on_location(&self, ctx: &Ctx, latitude: f64, longitude: f64) {
-        // 位置已经发来了，请求位置的那条提示消息就没用了
-        self.clear_location_prompt(ctx.chat_id).await;
         if !(latitude.is_finite() && longitude.is_finite()) {
             self.show(
                 ctx,
@@ -812,32 +873,10 @@ impl App {
         rows.push(home_row());
         self.show(
             ctx,
-            "📍 <b>附近站点</b>\n\n用下方的「发送我的位置」按钮共享位置。位置只用于查询附近站点，会保存为你最近一次坐标。",
+            "📍 <b>附近站点</b>\n\n点下方键盘里的「📍 附近站点」即可共享位置。位置只用于查询附近站点，会保存为你最近一次坐标。",
             Some(inline_keyboard(rows)),
         )
         .await;
-
-        // 共享位置需要普通键盘，只能单独发一条；收到位置后删掉
-        self.clear_location_prompt(ctx.chat_id).await;
-        match self
-            .tg
-            .send_message(ctx.chat_id, "👇 点这里发送位置", Some(location_keyboard()))
-            .await
-        {
-            Ok(message) => {
-                self.location_prompts
-                    .lock()
-                    .insert(ctx.chat_id, message.message_id);
-            }
-            Err(error) => eprintln!("[bot] 请求位置失败：{error}"),
-        }
-    }
-
-    async fn clear_location_prompt(&self, chat_id: i64) {
-        let Some(message_id) = self.location_prompts.lock().remove(&chat_id) else {
-            return;
-        };
-        let _ = self.tg.delete_message(chat_id, message_id).await;
     }
 
     // ─── 回调 ───
@@ -897,7 +936,7 @@ impl App {
                 self.show(
                     &ctx,
                     &format!("✅ 已切换到 <b>{}</b>\n\n{text}", render::escape(&label)),
-                    Some(markup),
+                    markup,
                 )
                 .await;
             }
@@ -1004,8 +1043,7 @@ impl App {
                 } else {
                     "当前没有进行中的盯车。\n\n"
                 };
-                self.show(&ctx, &format!("{prefix}{text}"), Some(markup))
-                    .await;
+                self.show(&ctx, &format!("{prefix}{text}"), markup).await;
             }
             Action::SettingsAdjust { field, steps } => {
                 let defaults = self.store.settings().defaults;
@@ -1032,7 +1070,7 @@ impl App {
                 self.store
                     .update(user_id, |user| user.pending = Pending::None);
                 let (text, markup) = self.home_view(user_id);
-                self.show(ctx, &text, Some(markup)).await;
+                self.show(ctx, &text, markup).await;
             }
             "fav" => {
                 let (text, markup) = self.favorites_view(user_id);
@@ -1073,7 +1111,8 @@ impl App {
 
     // ─── 各视图 ───
 
-    fn home_view(&self, user_id: i64) -> (String, Value) {
+    /// 主菜单卡片。命令都在常驻键盘上，这里只放跟内容有关的按钮。
+    fn home_view(&self, user_id: i64) -> (String, Option<Value>) {
         let user = self.store.get(user_id);
         let hour = self.hour();
         let city = user.city_label.clone().unwrap_or_else(|| "未选择".into());
@@ -1088,13 +1127,12 @@ impl App {
         let mut rows: Vec<Vec<(String, String)>> = Vec::new();
         let suggestions = user.suggestions(hour, 3);
         if suggestions.is_empty() {
-            text.push_str("\n发送线路名（如「K155」）直接搜索，或用下面的按钮。");
+            text.push_str("\n用下方键盘选功能，或直接发送线路名（如「K155」）搜索。");
         } else {
-            text.push_str(&format!("\n<b>{hour:02} 点你常查的</b>（点按钮直接看到站）：\n"));
+            text.push_str(&format!(
+                "\n<b>{hour:02} 点你常查的</b>（点按钮直接看到站）：\n"
+            ));
             for habit in &suggestions {
-                text.push_str(&format!("· {}\n", render::escape(&habit.label)));
-            }
-            for habit in suggestions {
                 rows.push(vec![(
                     render::habit_button_label(habit),
                     self.tokens.put(Action::Live {
@@ -1104,26 +1142,15 @@ impl App {
                     }),
                 )]);
             }
+            text.push_str("\n其余功能在下方键盘里。");
         }
 
-        rows.push(vec![
-            ("🔍 搜线路".into(), "m:search".into()),
-            ("📍 附近站点".into(), "m:nearby".into()),
-        ]);
-        rows.push(vec![
-            ("⭐ 我的收藏".into(), "m:fav".into()),
-            ("🔔 盯车".into(), "m:watch".into()),
-        ]);
-        rows.push(vec![
-            ("📊 我的习惯".into(), "m:habit".into()),
-            ("⚙️ 提醒设置".into(), "m:settings".into()),
-        ]);
-        rows.push(vec![
-            ("🏙 切换城市".into(), "m:city".into()),
-            ("❓ 使用说明".into(), "m:help".into()),
-        ]);
-
-        (text, inline_keyboard(rows))
+        let markup = if rows.is_empty() {
+            None
+        } else {
+            Some(inline_keyboard(rows))
+        };
+        (text, markup)
     }
 
     /// 城市选择界面。
@@ -1668,7 +1695,7 @@ impl App {
 
         // 主卡片回到菜单，避免和盯车卡片显示同一条线路
         let (text, markup) = self.home_view(user_id);
-        self.show(ctx, &format!("🔔 盯车已启动，见下方卡片。\n\n{text}"), Some(markup))
+        self.show(ctx, &format!("🔔 盯车已启动，见下方卡片。\n\n{text}"), markup)
             .await;
     }
 
@@ -1977,6 +2004,21 @@ impl App {
     }
 }
 
+/// 常驻键盘上的按钮文案对应哪个命令。
+fn keyboard_command(text: &str) -> Option<&'static str> {
+    match text {
+        "🔍 搜线路" => Some("line"),
+        "📍 附近站点" => Some("nearby"),
+        "⭐ 我的收藏" => Some("fav"),
+        "🔔 盯车" => Some("watch"),
+        "⚙️ 提醒设置" => Some("settings"),
+        "📊 我的习惯" => Some("habits"),
+        "🏙 切换城市" => Some("city"),
+        "❓ 使用说明" => Some("help"),
+        _ => None,
+    }
+}
+
 /// 这条更新属于哪个用户；拿不到就不处理（例如频道消息）。
 fn update_actor(update: &Update) -> Option<i64> {
     if let Some(message) = &update.message {
@@ -2014,19 +2056,23 @@ fn parse_command(text: &str) -> Option<(String, String)> {
 }
 
 const HELP_TEXT: &str = "🚏 <b>WhereBus 使用说明</b>\n\n\
-1️⃣ /city 选择城市与数据源（会记住）\n\
-2️⃣ 直接发送线路名（如「K155」）搜索，或 /line 关键词\n\
+功能都在输入框下方的键盘里，点一下就行：\n\
+🔍 搜线路 · 📍 附近站点（直接共享位置）\n\
+⭐ 我的收藏 · 🔔 盯车\n\
+⚙️ 提醒设置 · 📊 我的习惯\n\
+🏙 切换城市 · ❓ 使用说明\n\n\
+<b>怎么用</b>\n\
+1️⃣ 先「🏙 切换城市」选好城市与数据源（会记住）\n\
+2️⃣ 「🔍 搜线路」或直接发送线路名（如「K155」）\n\
 3️⃣ 在线路里点上车站，查看实时到站\n\
-4️⃣ 点「⭐ 收藏这一趟」保存「线路 + 上车站」，之后 /fav 一键刷新\n\
-5️⃣ 点「🔔 盯这趟车」开始盯车：卡片消息按设定间隔自动刷新，车快到时主动提醒你\n\
-6️⃣ /nearby 发送位置，查附近站点及各线路到站\n\
-7️⃣ /habits 查看常用线路与高峰时段；主菜单会按当前时段推荐\n\n\
-<b>盯车</b>（/watch）：选好线路与上车站后，可以指定等某一辆车，或跟随「最近的一班」。\
+4️⃣ 点「⭐ 收藏这一趟」保存「线路 + 上车站」，之后从「⭐ 我的收藏」一键刷新\n\
+5️⃣ 点「🔔 盯这趟车」开始盯车：卡片按设定间隔自动刷新，车快到时主动提醒你\n\n\
+<b>盯车</b>：选好线路与上车站后，可以指定等某一辆车，或跟随「最近的一班」。\
 默认在目标车还差 1 站时提醒一次，进入 500 米后每 60 秒重复提醒，每 10 秒刷新一次卡片；\
-这些都能在 /settings 里改。车进站或已驶过时自动结束。\n\n\
-所有界面都在同一张卡片上就地更新，不会越点越多；盯车卡片和到站提醒是单独的消息。\n\n\
+这些都能在「⚙️ 提醒设置」里改。车进站或已驶过时自动结束。\n\n\
+界面始终只有一张卡片，并且会跟着你的消息移到最新位置；盯车卡片与到站提醒是单独的消息。\n\n\
 数据来自公开的第三方公交数据源，没有任何模拟数据；上游异常时会如实提示。\n\
-你的城市选择、收藏和查询统计保存在运行机器人的服务器上，/cancel 可取消当前输入。";
+你的城市选择、收藏和查询统计保存在运行机器人的服务器上。";
 
 #[cfg(test)]
 mod tests {
@@ -2099,6 +2145,16 @@ mod tests {
         assert!(epochs.is_current(7, other));
         assert!(epochs.is_current(42, second));
         assert!(!epochs.is_current(7, second + 10));
+    }
+
+    #[test]
+    fn keyboard_buttons_map_to_commands() {
+        assert_eq!(keyboard_command("⭐ 我的收藏"), Some("fav"));
+        assert_eq!(keyboard_command("🔔 盯车"), Some("watch"));
+        assert_eq!(keyboard_command("🏙 切换城市"), Some("city"));
+        // 普通文字仍然按线路关键词处理
+        assert_eq!(keyboard_command("K155"), None);
+        assert_eq!(keyboard_command("我的收藏"), None);
     }
 
     #[test]

@@ -313,12 +313,18 @@ pub fn inline_keyboard(rows: Vec<Vec<(String, String)>>) -> Value {
     json!({ "inline_keyboard": rows })
 }
 
-/// 请求用户共享位置的普通键盘（仅私聊可用）。
-pub fn location_keyboard() -> Value {
+/// 常驻命令键盘：把命令做成输入框上方的按钮，省去记 / 命令。
+/// 「附近站点」直接是共享位置按钮，点一下就把坐标发过来（仅私聊可用）。
+pub fn command_keyboard() -> Value {
     json!({
-        "keyboard": [[{"text": "📍 发送我的位置", "request_location": true}]],
+        "keyboard": [
+            [{"text": "🔍 搜线路"}, {"text": "📍 附近站点", "request_location": true}],
+            [{"text": "⭐ 我的收藏"}, {"text": "🔔 盯车"}],
+            [{"text": "⚙️ 提醒设置"}, {"text": "📊 我的习惯"}],
+            [{"text": "🏙 切换城市"}, {"text": "❓ 使用说明"}],
+        ],
         "resize_keyboard": true,
-        "one_time_keyboard": true,
+        "is_persistent": true,
     })
 }
 
