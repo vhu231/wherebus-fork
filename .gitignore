@@ -6,6 +6,9 @@
 .vscode/
 .codacy/
 
-# Telegram 机器人的用户数据
+# 用户数据库与旧版 JSON 数据
+wherebus.db
+wherebus.db-wal
+wherebus.db-shm
 wherebus-bot-data.json
 wherebus-bot-data.json.tmp

@@ -28,44 +28,54 @@
 
 网页使用原生 HTML/CSS/JavaScript，通过同源 HTTP JSON API 查询公交 provider；不依赖 Android、模拟器、浏览器自动化或本地数据库。网页没有模拟公交数据，数据源出错会明确提示。
 
-另有一个可选的 Telegram 机器人（见 [Telegram 机器人](#telegram-机器人)）：
+同一个进程还提供（见 [Telegram 机器人](#telegram-机器人)）：
 
-- 交互式查询、收藏车次、记录并统计乘车习惯
-- **盯车主动推送**：指定在某线路某站台等哪辆车，按设定间隔轮询并原地更新卡片消息，车到前一站、进入设定距离时主动提醒
-- **管理后台**：Telegram Mini App 登录，用户管理自己的收藏与提醒设置，管理员查看 Bot 运行状态与用户列表
+- **Telegram 机器人**：交互式查询、收藏车次、记录并统计乘车习惯
+- **车次监控与主动推送**：指定在某线路某站台等哪辆车，按设定间隔轮询并原地更新卡片消息，车到前一站、进入设定距离时主动提醒
+- **我的面板**（Telegram Mini App）：用户自己管理城市、提醒偏好、收藏，并直接开始/停止车次监控
+- **管理控制台**（网页端 `/admin`）：首次进入设置管理口令，之后查看运行状态、全局默认值与用户列表
 
 ## 架构
 
-- `core/` — Rust 服务端
+- `core/` — Rust 服务端，只有一个二进制 `wherebus`
+  - `runtime` — 单进程启动：网页版、管理控制台与机器人共用一个端口、一个 SQLite 库
   - `web` — HTTP JSON API 与静态资源
-  - `bot` — Telegram 机器人（`bot` feature，默认不编译）：`telegram` 最小 Bot API 客户端、`app` 交互逻辑、`store` 用户数据、`watch` 盯车与推送、`auth` Mini App 登录校验、`admin` 管理后台接口、`render` 消息排版
+  - `bot` — Telegram 机器人：`telegram` 最小 Bot API 客户端、`app` 交互逻辑、`watch` 车次监控与推送、`store` + `db` 用户数据（SQLite）、`auth` 登录校验与口令哈希、`miniapp` 用户面板接口、`console` 管理控制台接口、`render` 消息排版
   - `provider` — 抽象接入不同城市数据源；`domain` — 共享数据模型
-- `web/` — 前端资源（原生 HTML/CSS/JavaScript），编译时内嵌进服务二进制；`miniapp.html` / `miniapp.js` 是管理面板
+- `web/` — 前端资源（原生 HTML/CSS/JavaScript），编译时内嵌进服务二进制：网页版、`miniapp.*`（Mini App 用户面板）、`admin.*`（管理控制台）
 
-网页与机器人共用同一套 provider：机器人直接调用 provider，不经过 HTTP 接口。机器人进程内同时挂载网页版与管理后台，共享同一份用户数据（单进程单写者，避免两个进程争同一个数据文件）。
+网页与机器人共用同一套 provider：机器人直接调用 provider，不经过 HTTP 接口；三者同进程运行，共享同一个 SQLite 数据库。
 
 ## 系统要求
 
 - Rust 工具链（edition 2024）
-- 平台 C/C++ 编译工具
+- 平台 C/C++ 编译工具（SQLite 随 `rusqlite` 的 bundled 特性一起编译，无需另外安装）
 
 ## 构建与启动
 
 在仓库根目录运行：
 
 ```sh
-cargo run --bin wherebus-web
+cargo run
 ```
 
-浏览器访问 <http://127.0.0.1:8080> 。前端资源编译内嵌于服务二进制，修改网页后需要重启编译。无需 Node.js 或前端依赖安装。
+一条命令同时启动：网页版 <http://127.0.0.1:8080>、管理控制台 <http://127.0.0.1:8080/admin>，以及（配置了令牌时）Telegram 机器人与它的 Mini App 用户面板。前端资源编译内嵌于服务二进制，修改网页后需要重启编译。无需 Node.js 或前端依赖安装。
+
+带机器人启动：
+
+```sh
+WHEREBUS_BOT_TOKEN=你的机器人令牌 cargo run
+```
+
+没设置 `WHEREBUS_BOT_TOKEN` 时不启动机器人，网页版与管理控制台照常可用。
 
 生产构建：
 
 ```sh
-cargo build --release --bin wherebus-web
+cargo build --release
 ```
 
-环境变量 `WHEREBUS_BIND` 控制监听地址，默认 `127.0.0.1:8080`。对外提供服务时，通过 HTTPS 反向代理部署，并在代理层配置访问限流。浏览器定位需要 HTTPS 或 localhost；也支持手动输入 WGS84 经纬度。城市选择不会自动修改输入的坐标。
+环境变量 `WHEREBUS_BIND` 控制监听地址，默认 `127.0.0.1:8080`。对外提供服务时，通过 HTTPS 反向代理部署，并在代理层配置访问限流；管理控制台会暴露全部用户数据，务必只在 HTTPS 或受信网络下开放。浏览器定位需要 HTTPS 或 localhost；也支持手动输入 WGS84 经纬度。城市选择不会自动修改输入的坐标。
 
 ## HTTP API
 
@@ -85,33 +95,19 @@ cargo build --release --bin wherebus-web
 
 ## Telegram 机器人
 
-交互式查询实时公交，把「线路 + 上车站」收藏为车次，盯着某一趟车到站前主动提醒你；同时记录查询习惯，在主菜单按当前时段推荐你常查的车次。
-
-### 启动
-
-```sh
-cargo run --features bot --bin wherebus-bot
-```
-
-生产构建：
-
-```sh
-cargo build --release --features bot --bin wherebus-bot
-```
-
-机器人默认不参与编译（`bot` 为可选 feature），不加 `--features bot` 时仓库行为与之前完全一致。启动后同一个进程还会监听一个 HTTP 端口，提供网页版与管理后台（见 [管理后台](#管理后台telegram-mini-app)）。
+与网页版同一个进程启动，共享同一个 SQLite 数据库。交互式查询实时公交，把「线路 + 上车站」收藏为车次，监控某一趟车并在到站前主动提醒；同时记录查询习惯，在主菜单按当前时段推荐常查车次。
 
 ### 环境变量
 
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `WHEREBUS_BOT_TOKEN` | 是 | — | 向 [@BotFather](https://t.me/BotFather) 申请的机器人令牌 |
-| `WHEREBUS_BOT_DATA` | 否 | `wherebus-bot-data.json` | 用户数据文件路径 |
+| `WHEREBUS_BIND` | 否 | `127.0.0.1:8080` | 网页版 / 管理控制台 / Mini App 的监听地址 |
+| `WHEREBUS_DB` | 否 | `wherebus.db` | SQLite 数据库路径 |
+| `WHEREBUS_BOT_TOKEN` | 否 | — | 向 [@BotFather](https://t.me/BotFather) 申请的机器人令牌；不设置就不启动机器人 |
+| `WHEREBUS_BOT_MINIAPP_URL` | 否 | — | 「我的面板」的公网 HTTPS 地址（`https://你的域名/miniapp`），不设置则机器人里不显示入口 |
 | `WHEREBUS_BOT_TZ` | 否 | `8` | 统计习惯、显示时间所用的时区偏移（小时） |
-| `WHEREBUS_BOT_WEB_BIND` | 否 | `127.0.0.1:8081` | 网页版 + 管理后台的监听地址 |
-| `WHEREBUS_BOT_MINIAPP_URL` | 否 | — | 管理面板的公网 HTTPS 地址（Mini App 入口），不设置则机器人内不显示入口 |
-| `WHEREBUS_BOT_ADMINS` | 否 | 空 | 管理员 Telegram 用户 ID，逗号分隔；只有他们能看到 Bot 管理 |
 | `WHEREBUS_BOT_API` | 否 | `https://api.telegram.org` | 自建 Bot API 服务地址，本地联调也用它 |
+| `WHEREBUS_BOT_DATA` | 否 | `wherebus-bot-data.json` | 旧版本的 JSON 数据文件；库里还没有用户时自动导入一次，原文件保留 |
 
 ### 命令与交互
 
@@ -122,72 +118,99 @@ cargo build --release --features bot --bin wherebus-bot
 | `/line [关键词]` | 搜索线路；直接发送线路名（如「1路」）等价于此命令 |
 | `/nearby` | 发送位置后列出附近站点及各线路到站情况 |
 | `/fav` | 我的收藏车次，一键刷新到站；可删除 |
-| `/watch` | 盯车：查看当前盯车状态，或从收藏里选一个开始盯 |
-| `/settings` | 提醒设置（刷新间隔、提前几站、距离阈值、重复间隔、最长盯车） |
+| `/watch` | 车次监控：查看当前监控状态，或从收藏里选一个开始 |
+| `/settings` | 提醒设置（刷新间隔、提前几站、距离阈值、重复间隔、最长监控） |
 | `/habits` | 常用线路、24 小时查询分布、当前时段推荐 |
-| `/app` | 打开管理面板（需配置 `WHEREBUS_BOT_MINIAPP_URL`） |
+| `/app` | 打开「我的面板」（需配置 `WHEREBUS_BOT_MINIAPP_URL`） |
 | `/help`、`/cancel` | 使用说明；取消当前输入 |
 
 交互路径：选城市 → 搜线路（或附近站点）→ 选上车站 → 实时到站页「🔄 刷新 / ⭐ 收藏这一趟 / 🔔 盯这趟车 / 🚏 换上车站」。收藏保存的是「线路 + 方向 + 上车站」的组合，之后从 `/fav` 一键查看该站到站情况。
 
-### 盯车与主动推送
+### 车次监控与主动推送
 
-在实时到站页点「🔔 盯这趟车」，选择要等的具体车辆，或选「⚡ 最近的一班」自动跟随离站最近的一辆（上游没给车辆编号时只能用自动模式，卡片会注明预估未关联车辆）。
+在实时到站页点「🔔 盯这趟车」（或在「我的面板」里选线路与上车站），选择要等的具体车辆，或选「⚡ 最近的一班」自动跟随离站最近的一辆（上游没给车辆编号时只能用自动模式，卡片会注明预估未关联车辆）。
 
 机器人随后会：
 
 - 按 `刷新间隔`（默认 10 秒）轮询实时数据，**原地更新同一条卡片消息**，不刷屏；
 - 目标车还差 `提前提醒` 站（默认 1 站，即到前一站）时，单独推送一条带通知的提醒，只发一次；
 - 目标车进入 `距离提醒` 阈值（默认 500 米）后，按 `重复间隔`（默认 60 秒）反复提醒，直到上车；
-- 车正在进上车站或已驶过时推送最后一条提醒并结束盯车；
-- 超过 `最长盯车` 时间（默认 60 分钟）或连续 6 次取不到实时数据时自动结束；
-- 随时可以点卡片上的「⏹ 停止盯车」，或在管理面板里停止。
+- 车正在进上车站或已驶过时推送最后一条提醒并结束监控；
+- 超过 `最长监控` 时间（默认 60 分钟）或连续 6 次取不到实时数据时自动结束；
+- 随时可以点卡片上的「⏹ 停止盯车」，或在「我的面板」/管理控制台里停止。
 
-阈值全部可调：机器人里 `/settings` 用 ➖ ➕ 调整，或在管理面板里改；管理员可以在管理面板设置全局默认值，供没有个人设置的用户使用。每一轮轮询都会重新读取设置，改完立即生效。`距离` 取自上游返回的「车辆距上车站距离」，数据源不提供时该条提醒不会触发。
+阈值全部可调：机器人里 `/settings` 用 ➖ ➕ 调整，或在「我的面板」里改；管理员可在控制台设置全局默认值，供没有个人设置的用户使用。每一轮轮询都会重新读取设置，改完立即生效。`距离` 取自上游返回的「车辆距上车站距离」，数据源不提供时该条提醒不会触发。
 
-同一用户同时只有一个盯车任务，开始新的会替换旧的。盯车任务会落盘，机器人重启后自动恢复并继续更新原来的卡片消息。
+同一用户同时只有一个监控任务，开始新的会替换旧的。任务落库，重启后自动恢复并继续更新原来的卡片消息。
 
-### 管理后台（Telegram Mini App）
+### 我的面板（Telegram Mini App）
 
-机器人进程在 `WHEREBUS_BOT_WEB_BIND` 上同时提供：
+给**用户自己**用的面板，地址 `/miniapp`，只能在 Telegram 里打开：
 
-- `/` — 网页版（与 `wherebus-web` 相同的匿名查询界面）
-- `/miniapp` — 管理面板，作为 Telegram Mini App 打开
+- 个人资料与乘车习惯统计
+- 切换城市与数据源
+- 提醒偏好（刷新间隔、提前几站、距离阈值、重复间隔、最长监控），可恢复为全局默认
+- 收藏车次：查看、删除、一键开始监控
+- 车次监控：搜索线路 → 选上车站 → 选车辆或「最近的一班」→ 开始；也能随时停止
+- 删除自己的全部数据
 
-**登录**：面板只接受 Telegram Mini App 的 `initData`，服务端按官方算法用 bot token 校验 HMAC-SHA256 签名与时效（24 小时），通过后签发 12 小时有效的会话令牌。前端传来的用户 ID 一律不作为身份依据；伪造或篡改的 `initData` 会被拒绝。
+登录方式：面板只接受 Telegram Mini App 的 `initData`，服务端按官方算法用 bot token 校验 HMAC-SHA256 签名与时效（24 小时），通过后签发 12 小时有效的会话令牌。前端传来的用户 ID 一律不作为身份依据；伪造或篡改的 `initData` 会被拒绝。
 
-**普通用户**（「我的」）：查看资料与统计、管理收藏、调整提醒设置、查看并停止当前盯车、删除自己的全部数据。
+配置：把服务通过 HTTPS 暴露出去，然后设置 `WHEREBUS_BOT_MINIAPP_URL=https://你的域名/miniapp`。机器人会把聊天窗口的菜单按钮指向它，主菜单也会出现「🧭 我的面板」。
 
-**管理员**（「Bot 管理」，仅 `WHEREBUS_BOT_ADMINS` 列出的用户可见）：Bot 运行状态（运行时长、用户数、收藏数、累计查询、进行中的盯车、活跃会话）、全局默认提醒设置、是否接纳新用户、用户列表（停用/解除停用、停止某人的盯车）。管理员不能被停用或被其他管理员删除，避免后台被锁死。
-
-配置步骤：
-
-1. 把管理面板通过 HTTPS 暴露出去（反向代理到 `WHEREBUS_BOT_WEB_BIND`），Telegram 只允许 HTTPS 的 Mini App 地址；
-2. 设置 `WHEREBUS_BOT_MINIAPP_URL=https://你的域名/miniapp`，机器人会自动把聊天窗口的菜单按钮指向它，主菜单也会出现「🧭 管理面板」；
-3. 设置 `WHEREBUS_BOT_ADMINS=你的 Telegram 用户 ID`（可向 [@userinfobot](https://t.me/userinfobot) 查询）。
-
-HTTP 接口（均需 `Authorization: Bearer <会话令牌>`，`/api/auth/telegram` 除外）：
+接口（除登录外都需要 `Authorization: Bearer <会话令牌>`）：
 
 | 方法与路径 | 用途 |
 | --- | --- |
 | `POST /api/auth/telegram` | 用 `initData` 登录，返回会话令牌 |
-| `GET /api/me` | 我的资料、设置、收藏、习惯、盯车状态 |
-| `POST /api/me/settings` | 修改我的提醒设置（`values`）或恢复默认（`reset`） |
+| `GET /api/me` | 我的资料、偏好、收藏、习惯、监控状态 |
+| `POST /api/me/settings` | 修改提醒偏好（`values`）或恢复默认（`reset`） |
+| `POST /api/me/city` | 切换城市与数据源 |
 | `POST /api/me/favorites/delete` | 删除一条收藏 |
-| `POST /api/me/watch/stop` | 停止我的盯车 |
+| `POST /api/me/watch/start` | 开始车次监控（`direction`、`order`，可选 `service`、`bus`） |
+| `POST /api/me/watch/stop` | 停止车次监控 |
 | `DELETE /api/me` | 删除我的全部数据 |
-| `GET /api/admin/overview` | Bot 运行状态（管理员） |
-| `GET /api/admin/users` | 用户列表（管理员） |
-| `POST /api/admin/users/action` | `ban` / `unban` / `stop_watch` / `delete`（管理员） |
-| `POST /api/admin/settings` | 全局默认提醒设置、是否接纳新用户（管理员） |
+
+### 管理控制台（网页端）
+
+地址 `/admin`，与 Telegram 身份无关：
+
+- **首次进入时设置管理口令**（至少 8 位）。口令用 PBKDF2-HMAC-SHA256（20 万次迭代、随机盐）哈希后存进数据库的 `meta` 表，只保存哈希值。
+- 之后凭口令登录，会话令牌只存在内存（进程重启即失效），保存在浏览器的 `sessionStorage` 里。
+- 忘记口令：删掉数据库里 `meta` 表的 `admin_password` 记录，下次打开会重新进入首次设置流程。
+- 改口令会作废其他设备上的登录。
+
+功能：运行状态（用户数、收藏数、累计查询、进行中的监控、运行时长、数据库路径）、全局默认提醒设置、是否接纳新用户、用户列表（停用 / 解除停用 / 停止其监控 / 删除其数据）。机器人没启动时控制台照常可用，只是不显示机器人相关状态。
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `GET /api/console/status` | 是否已设置口令、机器人是否运行（公开） |
+| `POST /api/console/setup` | 首次设置口令（已设置过则拒绝） |
+| `POST /api/console/login`、`POST /api/console/logout` | 登录 / 退出 |
+| `POST /api/console/password` | 修改口令（需当前口令） |
+| `GET /api/console/overview`、`GET /api/console/users` | 运行状态、用户列表 |
+| `POST /api/console/users/action` | `ban` / `unban` / `stop_watch` / `delete` |
+| `POST /api/console/settings` | 全局默认提醒设置、是否接纳新用户 |
 
 越界的设置值会被夹到合法区间（例如刷新间隔不低于 5 秒），未知设置项返回 400。
 
-### 用户数据
+### 数据存储
 
-保存在运行机器人的服务器本地 JSON 文件里（先写临时文件再 rename，每 5 秒及退出时落盘），每个 Telegram 用户一条记录：城市选择、收藏车次、按小时的查询次数、提醒设置、当前盯车任务、最近一次定位（已转换为 GCJ-02）、昵称（仅用于管理界面展示）。位置仅用于查询附近站点。用户可在管理面板里自行删除全部数据；删除数据文件则清空所有人的数据。
+SQLite（默认 `wherebus.db`，WAL 模式），表结构：
 
-按钮参数存在内存中（callback_data 限长 64 字节），机器人重启后旧消息上的按钮会失效并提示重新查询；收藏、习惯与盯车任务不受影响。
+| 表 | 内容 |
+| --- | --- |
+| `users` | 城市选择、昵称、查询次数、最近定位（已转换为 GCJ-02）、是否停用、个人提醒设置（全为 NULL 表示跟随全局默认） |
+| `favorites` | 收藏的「线路 + 方向 + 上车站」 |
+| `habits` | 每条线路按小时的查询次数分布 |
+| `watches` | 进行中的车次监控，重启后据此恢复 |
+| `meta` | 全局默认设置、是否接纳新用户、管理口令哈希 |
+
+每次改动立即写库（一个用户的完整状态在一次事务里写完），进程被杀不会丢数据。首次启动时，如果库里还没有用户而旧的 `wherebus-bot-data.json` 存在，会自动导入一次，原文件保留作备份。
+
+用户可在「我的面板」里删除自己的全部数据；管理员可在控制台删除任一用户的数据。
+
+按钮参数存在内存中（callback_data 限长 64 字节），机器人重启后旧消息上的按钮会失效并提示重新查询；收藏、习惯与监控任务不受影响。
 
 ## 支持的数据源
 
@@ -199,17 +222,20 @@ HTTP 接口（均需 `Authorization: Bearer <会话令牌>`，`/api/auth/telegra
 ## 验证
 
 ```sh
-cargo test -p wherebus web::tests
-cargo test -p wherebus --features bot bot::
+cargo test
 node --check web/app.js
 node --check web/bus-view.js
+node --check web/miniapp.js
+node --check web/admin.js
 ```
 
-机器人人工检查：`/city` 选城市 → 发送线路名 → 选上车站 → 收藏 → `/fav` 刷新 → `/habits` 查看统计；「🔔 盯这趟车」→ 选车 → 观察卡片按设定间隔更新、到前一站与进入距离阈值时收到推送 → 「⏹ 停止盯车」；`/settings` 改阈值后确认下一轮立即生效；重启机器人确认盯车自动恢复。此外还应覆盖未选城市、关键词无结果、上游报错、按钮过期（重启后点旧按钮）。
+机器人人工检查：`/city` 选城市 → 发送线路名 → 选上车站 → 收藏 → `/fav` 刷新 → `/habits` 查看统计；「🔔 盯这趟车」→ 选车 → 观察卡片按设定间隔更新、到前一站与进入距离阈值时收到推送 → 「⏹ 停止盯车」；`/settings` 改阈值后确认下一轮立即生效；重启进程确认监控自动恢复。此外还应覆盖未选城市、关键词无结果、上游报错、按钮过期（重启后点旧按钮）。
 
-管理面板人工检查：从机器人菜单按钮打开 → 「我的」改设置 / 删收藏 / 停盯车 → 管理员再看「Bot 管理」的运行状态、全局默认值与用户列表；直接用浏览器打开 `/miniapp`（没有 Telegram 的 initData）应提示只能在 Telegram 内使用。
+我的面板人工检查：从机器人菜单按钮打开 → 切换城市 → 改提醒偏好 → 搜索线路并开始监控 → 停止监控 → 删除收藏；直接用浏览器打开 `/miniapp`（没有 Telegram 的 initData）应提示只能在 Telegram 内使用。
 
-本地联调机器人不需要真实令牌：把 `WHEREBUS_BOT_API` 指向一个本地假 Bot API 服务即可驱动整条链路；调试构建还内置了 `debug_beijing` 模拟数据源，可用于验证盯车提醒。
+管理控制台人工检查：用空数据库打开 `/admin` 应进入首次设置流程 → 设置口令后看到运行状态与用户列表 → 改全局默认值 → 停用/解除停用某个用户 → 修改口令后确认其他会话失效。
+
+本地联调机器人不需要真实令牌：把 `WHEREBUS_BOT_API` 指向一个本地假 Bot API 服务即可驱动整条链路；调试构建还内置了 `debug_beijing` 模拟数据源，可用于验证监控提醒。
 
 网页人工检查：选择城市 → 搜索线路 → 打开详情 → 点击上车站 → 换向；输入经纬度 → 附近站点 → 经过线路；验证无结果、定位拒绝、数据源失败及手机窄屏布局。实际公交数据的可用性取决于上游服务，健康检查成功不表示上游可用。
 

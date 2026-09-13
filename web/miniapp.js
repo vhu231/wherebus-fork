@@ -1,8 +1,8 @@
-/* WhereBus 管理面板：Telegram Mini App 前端。
-   身份由服务端校验 initData 签名后签发会话令牌，这里只负责展示与调用接口。 */
+/* WhereBus 用户面板（Telegram Mini App）：管理个人偏好、收藏与车次监控。
+   身份由服务端校验 initData 签名后签发会话令牌；站点管理在网页端 /admin。 */
 const tg = window.Telegram && window.Telegram.WebApp;
 const $ = id => document.getElementById(id);
-const state = { token: null, me: null, isAdmin: false };
+const state = { token: null, me: null, pick: { service: null, line: null, stops: [], order: null } };
 
 function el(tag, text, className) {
   const node = document.createElement(tag);
@@ -16,14 +16,20 @@ function status(text, isError = false) {
 }
 function since(unix) {
   if (!unix) return '—';
-  const minutes = Math.max(0, Math.round((Date.now() / 1000 - unix) / 60));
-  if (minutes < 60) return `${minutes} 分钟前`;
-  if (minutes < 60 * 24) return `${Math.round(minutes / 60)} 小时前`;
+  const minutes = Math.max(0, (Date.now() / 1000 - unix) / 60);
+  if (minutes < 60) return `${Math.round(minutes)} 分钟前`;
+  if (minutes < 1440) return `${Math.round(minutes / 60)} 小时前`;
   return `${Math.round(minutes / 1440)} 天前`;
 }
 function duration(secs) {
   const hours = Math.floor(secs / 3600), minutes = Math.floor((secs % 3600) / 60);
   return hours ? `${hours} 小时 ${minutes} 分钟` : `${minutes} 分钟`;
+}
+function confirmDialog(message) {
+  return new Promise(resolve => {
+    if (tg && tg.showConfirm) tg.showConfirm(message, resolve);
+    else resolve(window.confirm(message));
+  });
 }
 
 async function api(path, options = {}) {
@@ -39,6 +45,13 @@ async function api(path, options = {}) {
   if (!response.ok) throw new Error(body.error || `请求失败（${response.status}）`);
   return body;
 }
+/* 公交数据走公开的查询接口，与网页版同源同一套 */
+async function bus(path, params) {
+  const response = await fetch(`/api/${path}?` + new URLSearchParams(params), { cache: 'no-store' });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `请求失败（${response.status}）`);
+  return body.data;
+}
 
 /* ─── 我的 ─── */
 
@@ -48,43 +61,27 @@ function renderMe(me) {
   view.replaceChildren();
 
   const profile = el('div', null, 'card');
-  profile.append(
-    el('div', `${me.name || '未命名'}${me.username ? ' @' + me.username : ''}`),
-    el('div', `城市：${me.city || '未选择'} · 累计查询 ${me.queries} 次 · 收藏 ${me.favorites.length} 条`, 'muted'),
-    el('div', `最近活跃：${since(me.last_seen)}`, 'muted'),
-  );
+  profile.append(el('h2', '个人资料'));
+  profile.append(el('div', `${me.name || '未命名'}${me.username ? ' @' + me.username : ''}`));
+  profile.append(el('div', `累计查询 ${me.queries} 次 · 收藏 ${me.favorites.length} 条 · 最近活跃 ${since(me.last_seen)}`, 'muted'));
+  const cityRow = el('div', null, 'row');
+  cityRow.append(el('div', `城市：${me.city || '未选择'}`));
+  const change = el('button', '切换城市', 'ghost');
+  change.onclick = () => pickCity(profile, change);
+  cityRow.append(change);
+  profile.append(cityRow);
   view.append(profile);
 
-  // 盯车
-  const watchCard = el('div', null, 'card');
-  watchCard.append(el('h2', '盯车'));
-  if (me.watch) {
-    const row = el('div', null, 'row');
-    row.append(el('div', `${me.watch.label}（已盯 ${duration(Math.max(0, Date.now() / 1000 - me.watch.started_at))}）`));
-    const stop = el('button', '停止', 'danger');
-    stop.onclick = async () => {
-      stop.disabled = true;
-      try { await api('/api/me/watch/stop', { method: 'POST', body: '{}' }); await loadMe(); status('盯车已停止。'); }
-      catch (error) { status(error.message, true); stop.disabled = false; }
-    };
-    row.append(stop);
-    watchCard.append(row);
-  } else {
-    watchCard.append(el('p', '当前没有进行中的盯车。在机器人里打开线路的实时到站页，点「🔔 盯这趟车」即可开始。', 'muted'));
-  }
-  view.append(watchCard);
-
-  // 提醒设置
   const settings = el('div', null, 'card');
-  settings.append(el('h2', '提醒设置'));
+  settings.append(el('h2', '提醒偏好'));
   settings.append(el('p', me.alerts.using_defaults ? '当前跟随全局默认值，改动任一项后变为个人设置。' : '当前使用个人设置。', 'muted'));
   me.alerts.fields.forEach(field => {
     const row = el('div', null, 'row');
     row.append(el('div', field.label));
     const stepper = el('div', null, 'stepper');
-    const minus = el('button', '➖', 'ghost');
+    const minus = el('button', '−', 'ghost');
     const value = el('output', `${me.alerts.values[field.key]} ${field.unit}`);
-    const plus = el('button', '➕', 'ghost');
+    const plus = el('button', '+', 'ghost');
     const change = delta => async () => {
       const next = Math.min(field.max, Math.max(field.min, me.alerts.values[field.key] + delta * field.step));
       minus.disabled = plus.disabled = true;
@@ -105,13 +102,18 @@ function renderMe(me) {
   settings.append(reset);
   view.append(settings);
 
-  // 收藏
   const favorites = el('div', null, 'card');
   favorites.append(el('h2', `收藏车次（${me.favorites.length}）`));
-  if (!me.favorites.length) favorites.append(el('p', '还没有收藏。', 'muted'));
+  if (!me.favorites.length) favorites.append(el('p', '还没有收藏。在机器人里查看线路到站后点「⭐ 收藏这一趟」。', 'muted'));
   me.favorites.forEach(favorite => {
     const row = el('div', null, 'row');
-    row.append(el('div', `${favorite.line_name} @ ${favorite.station_name}\n${favorite.city_label} · 查过 ${favorite.hits} 次`));
+    const info = el('div');
+    info.append(el('div', `${favorite.line_name} @ ${favorite.station_name}`));
+    info.append(el('div', `${favorite.city_label} · 查过 ${favorite.hits} 次`, 'muted'));
+    row.append(info);
+    const buttons = el('div', null, 'stepper');
+    const watch = el('button', '监控', 'ghost');
+    watch.onclick = () => startWatch({ service: favorite.service, direction: favorite.direction, order: favorite.order });
     const remove = el('button', '删除', 'ghost');
     remove.onclick = async () => {
       remove.disabled = true;
@@ -122,12 +124,12 @@ function renderMe(me) {
         }));
       } catch (error) { status(error.message, true); remove.disabled = false; }
     };
-    row.append(remove);
+    buttons.append(watch, remove);
+    row.append(buttons);
     favorites.append(row);
   });
   view.append(favorites);
 
-  // 习惯
   const habits = el('div', null, 'card');
   habits.append(el('h2', '乘车习惯'));
   const max = Math.max(1, ...me.hour_histogram);
@@ -138,136 +140,168 @@ function renderMe(me) {
   if (!me.habits.length) habits.append(el('p', '还没有查询记录。', 'muted'));
   view.append(habits);
 
-  // 删除我的数据
   const danger = el('div', null, 'card');
-  danger.append(el('h2', '数据'));
-  danger.append(el('p', '删除后，你的城市选择、收藏、习惯统计与盯车任务都会被清空，且无法恢复。', 'muted'));
+  danger.append(el('h2', '我的数据'));
+  danger.append(el('p', '删除后，你的城市选择、收藏、习惯统计与监控任务都会被清空，且无法恢复。', 'muted'));
   const forget = el('button', '删除我的全部数据', 'danger');
   forget.onclick = async () => {
-    const ok = await confirmDialog('确认删除你的全部数据？此操作不可撤销。');
-    if (!ok) return;
-    try { await api('/api/me', { method: 'DELETE' }); status('数据已删除，可以关闭面板。'); $('view-me').replaceChildren(el('p', '数据已删除。', 'muted')); }
-    catch (error) { status(error.message, true); }
+    if (!(await confirmDialog('确认删除你的全部数据？此操作不可撤销。'))) return;
+    try {
+      await api('/api/me', { method: 'DELETE' });
+      status('数据已删除，可以关闭面板。');
+      $('view-me').replaceChildren(el('p', '数据已删除。', 'muted'));
+      $('view-watch').replaceChildren();
+    } catch (error) { status(error.message, true); }
   };
   danger.append(forget);
   view.append(danger);
 }
 
-function confirmDialog(message) {
-  return new Promise(resolve => {
-    if (tg && tg.showConfirm) tg.showConfirm(message, resolve);
-    else resolve(window.confirm(message));
-  });
-}
-
-async function loadMe() {
-  renderMe(await api('/api/me'));
-}
-
-/* ─── Bot 管理 ─── */
-
-async function loadAdmin() {
-  const view = $('view-admin');
-  view.replaceChildren(el('p', '正在加载…', 'muted'));
+async function pickCity(card, button) {
+  button.disabled = true;
   try {
-    const [overview, users] = await Promise.all([api('/api/admin/overview'), api('/api/admin/users')]);
-    view.replaceChildren();
-
-    const stats = el('div', null, 'card');
-    stats.append(el('h2', `@${overview.bot} 运行状态`));
-    [
-      ['已运行', duration(overview.uptime_secs)],
-      ['用户 / 已停用', `${overview.users} / ${overview.banned}`],
-      ['收藏 / 累计查询', `${overview.favorites} / ${overview.queries}`],
-      ['进行中的盯车', String(overview.watches_active)],
-      ['活跃会话 / 管理员', `${overview.sessions_active} / ${overview.admins}`],
-      ['时区', `UTC${overview.tz_offset >= 0 ? '+' : ''}${overview.tz_offset}`],
-      ['数据文件', overview.data_file],
-    ].forEach(([label, value]) => {
-      const row = el('div', null, 'row');
-      row.append(el('div', label, 'muted'), el('div', value));
-      stats.append(row);
+    const services = await bus('services', {});
+    const box = el('div', null, 'stack');
+    const select = el('select');
+    services.forEach(service => {
+      const option = el('option', `${service.province} · ${service.city} / ${service.provider}`);
+      option.value = service.id;
+      if (service.id === state.me.service) option.selected = true;
+      select.append(option);
     });
-    view.append(stats);
-
-    const globals = el('div', null, 'card');
-    globals.append(el('h2', '全局默认提醒设置'), el('p', '新用户以及没有个人设置的用户使用这组默认值。', 'muted'));
-    overview.settings.defaults.fields.forEach(field => {
-      const row = el('div', null, 'row');
-      row.append(el('div', field.label));
-      const stepper = el('div', null, 'stepper');
-      const minus = el('button', '➖', 'ghost');
-      const value = el('output', `${overview.settings.defaults.values[field.key]} ${field.unit}`);
-      const plus = el('button', '➕', 'ghost');
-      const change = delta => async () => {
-        const next = Math.min(field.max, Math.max(field.min, overview.settings.defaults.values[field.key] + delta * field.step));
-        minus.disabled = plus.disabled = true;
-        try { await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ values: { [field.key]: next } }) }); await loadAdmin(); }
-        catch (error) { status(error.message, true); minus.disabled = plus.disabled = false; }
-      };
-      minus.onclick = change(-1);
-      plus.onclick = change(1);
-      stepper.append(minus, value, plus);
-      row.append(stepper);
-      globals.append(row);
-    });
-    const allowRow = el('div', null, 'row');
-    allowRow.append(el('div', '接纳新用户'));
-    const toggle = el('button', overview.settings.allow_new_users ? '开启中' : '已关闭', overview.settings.allow_new_users ? '' : 'ghost');
-    toggle.onclick = async () => {
-      toggle.disabled = true;
-      try { await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ allow_new_users: !overview.settings.allow_new_users }) }); await loadAdmin(); }
-      catch (error) { status(error.message, true); toggle.disabled = false; }
+    const save = el('button', '保存城市');
+    save.onclick = async () => {
+      save.disabled = true;
+      try {
+        renderMe(await api('/api/me/city', { method: 'POST', body: JSON.stringify({ service: select.value }) }));
+        status('城市已更新。');
+      } catch (error) { status(error.message, true); save.disabled = false; }
     };
-    allowRow.append(toggle);
-    globals.append(allowRow);
-    view.append(globals);
+    box.append(select, save);
+    card.append(box);
+  } catch (error) { status(error.message, true); }
+  button.disabled = false;
+}
 
-    const table = el('div', null, 'card');
-    table.append(el('h2', `用户（${users.users.length}）`));
-    const grid = el('table');
-    const head = el('tr');
-    ['用户', '城市 / 盯车', '收藏·查询', '操作'].forEach(title => head.append(el('th', title)));
-    grid.append(head);
-    users.users.forEach(user => {
-      const row = el('tr');
-      const who = el('td');
-      who.append(el('div', `${user.name || '未命名'}${user.username ? ' @' + user.username : ''}`));
-      who.append(el('div', `${user.id} · ${since(user.last_seen)}`, 'muted'));
-      if (user.is_admin) who.append(el('span', '管理员', 'pill'));
-      if (user.banned) who.append(el('span', '已停用', 'pill off'));
-      row.append(who);
-      row.append(el('td', `${user.city || '未选择'}${user.watch ? '\n🔔 ' + user.watch : ''}`));
-      row.append(el('td', `${user.favorites} · ${user.queries}`));
+/* ─── 车次监控 ─── */
 
-      const actions = el('td');
-      if (user.watch) {
-        const stop = el('button', '停盯车', 'ghost');
-        stop.onclick = () => act(user.id, 'stop_watch');
-        actions.append(stop);
-      }
-      if (!user.is_admin) {
-        const ban = el('button', user.banned ? '解除停用' : '停用', user.banned ? 'ghost' : 'danger');
-        ban.onclick = () => act(user.id, user.banned ? 'unban' : 'ban');
-        actions.append(ban);
-      }
-      row.append(actions);
-      grid.append(row);
+function renderWatch() {
+  const me = state.me;
+  const view = $('view-watch');
+  view.replaceChildren();
+
+  const current = el('div', null, 'card');
+  current.append(el('h2', '当前监控'));
+  if (me.watch) {
+    current.append(el('div', me.watch.label));
+    current.append(el('div', `已监控 ${duration(Math.max(0, Date.now() / 1000 - me.watch.started_at))} · 提醒发送到你与机器人的聊天里`, 'muted'));
+    const stop = el('button', '停止监控', 'danger');
+    stop.onclick = async () => {
+      stop.disabled = true;
+      try { const result = await api('/api/me/watch/stop', { method: 'POST', body: '{}' }); renderMe(result.me); renderWatch(); status('监控已停止。'); }
+      catch (error) { status(error.message, true); stop.disabled = false; }
+    };
+    current.append(stop);
+  } else {
+    current.append(el('p', '没有进行中的监控。选好线路与上车站即可开始，同一时间只能监控一趟车。', 'muted'));
+  }
+  view.append(current);
+
+  if (me.favorites.length) {
+    const quick = el('div', null, 'card');
+    quick.append(el('h2', '从收藏开始'));
+    const list = el('div', null, 'list');
+    me.favorites.forEach(favorite => {
+      const button = el('button', `${favorite.line_name} @ ${favorite.station_name}`, 'ghost wide');
+      button.onclick = () => startWatch({ service: favorite.service, direction: favorite.direction, order: favorite.order });
+      list.append(button);
     });
-    table.append(grid);
-    view.append(table);
+    quick.append(list);
+    view.append(quick);
+  }
+
+  const search = el('div', null, 'card');
+  search.append(el('h2', '搜索线路'));
+  if (!me.service) {
+    search.append(el('p', '先在「我的」里选择城市。', 'muted'));
+    view.append(search);
+    return;
+  }
+  const form = el('form', null, 'stack');
+  const keyword = el('input');
+  keyword.placeholder = '线路名，例如 1路 / K155';
+  const submit = el('button', '搜索');
+  form.append(keyword, submit);
+  const results = el('div', null, 'list');
+  form.onsubmit = async event => {
+    event.preventDefault();
+    if (!keyword.value.trim()) return;
+    submit.disabled = true;
+    results.replaceChildren(el('p', '正在查询…', 'muted'));
+    try {
+      const lines = await bus('lines', { service: me.service, q: keyword.value.trim() });
+      results.replaceChildren();
+      if (!lines.length) results.append(el('p', '没有找到匹配的线路。', 'muted'));
+      lines.slice(0, 30).forEach(line => {
+        const button = el('button', `${line.name} → ${line.endpoints.terminus || '终点待更新'}`, 'ghost wide');
+        button.onclick = () => pickStop(line, results);
+        results.append(button);
+      });
+    } catch (error) { results.replaceChildren(el('p', error.message, 'error')); }
+    submit.disabled = false;
+  };
+  search.append(form, results);
+  view.append(search);
+}
+
+async function pickStop(line, container) {
+  container.replaceChildren(el('p', '正在加载站点…', 'muted'));
+  try {
+    const detail = await bus('line', { service: state.me.service, direction: line.direction_id });
+    container.replaceChildren();
+    container.append(el('div', `${detail.name}：选择上车站`, 'muted'));
+    detail.topology.stations.forEach(stop => {
+      const button = el('button', `${stop.order}. ${stop.name}`, 'ghost wide');
+      button.onclick = () => pickBus(detail, stop, container);
+      container.append(button);
+    });
+  } catch (error) { container.replaceChildren(el('p', error.message, 'error')); }
+}
+
+async function pickBus(detail, stop, container) {
+  container.replaceChildren(el('p', '正在查询在途车辆…', 'muted'));
+  const base = { service: state.me.service, direction: detail.direction_id, order: stop.order };
+  try {
+    const realtime = await bus('realtime', base);
+    container.replaceChildren();
+    container.append(el('div', `${detail.name} @ ${stop.name}：选择要等的车`, 'muted'));
+    const auto = el('button', '⚡ 最近的一班（自动跟随）', 'wide');
+    auto.onclick = () => startWatch(base);
+    container.append(auto);
+    realtime.buses.filter(item => item.bus_id).forEach(item => {
+      const button = el('button', `🚌 车辆 ${item.bus_id}（第 ${item.station_index} 站）`, 'ghost wide');
+      button.onclick = () => startWatch({ ...base, bus: item.bus_id });
+      container.append(button);
+    });
+    if (!realtime.buses.length) {
+      container.append(el('p', '上游当前没有在途车辆数据，可以先用「最近的一班」。', 'muted'));
+    }
   } catch (error) {
-    view.replaceChildren(el('p', error.message, 'error'));
+    container.replaceChildren(el('p', error.message, 'error'));
+    const auto = el('button', '⚡ 仍然监控最近的一班', 'wide');
+    auto.onclick = () => startWatch(base);
+    container.append(auto);
   }
 }
 
-async function act(userId, action) {
-  const labels = { ban: '停用该用户？', unban: '解除停用？', stop_watch: '停止该用户的盯车？', delete: '删除该用户全部数据？' };
-  if (!(await confirmDialog(labels[action] || '确认操作？'))) return;
+async function startWatch(body) {
+  status('正在启动监控…');
   try {
-    await api('/api/admin/users/action', { method: 'POST', body: JSON.stringify({ user_id: userId, action }) });
-    await loadAdmin();
-    status('操作完成。');
+    const me = await api('/api/me/watch/start', { method: 'POST', body: JSON.stringify(body) });
+    renderMe(me);
+    renderWatch();
+    showTab('watch');
+    status('监控已启动，提醒会发到机器人聊天里。');
   } catch (error) { status(error.message, true); }
 }
 
@@ -275,29 +309,27 @@ async function act(userId, action) {
 
 function showTab(which) {
   $('tab-me').setAttribute('aria-selected', String(which === 'me'));
-  $('tab-admin').setAttribute('aria-selected', String(which === 'admin'));
+  $('tab-watch').setAttribute('aria-selected', String(which === 'watch'));
   $('view-me').hidden = which !== 'me';
-  $('view-admin').hidden = which !== 'admin';
-  if (which === 'admin') loadAdmin();
+  $('view-watch').hidden = which !== 'watch';
+  if (which === 'watch') renderWatch();
 }
 
 (async () => {
   if (tg) { tg.ready(); tg.expand(); }
   const initData = tg && tg.initData;
   if (!initData) {
-    status('请在 Telegram 里通过机器人的「管理面板」按钮打开本页面。', true);
+    status('请在 Telegram 里通过机器人的「我的面板」按钮打开本页面。', true);
     return;
   }
   try {
     const session = await api('/api/auth/telegram', { method: 'POST', body: JSON.stringify({ init_data: initData }) });
     state.token = session.token;
-    state.isAdmin = session.is_admin;
-    status(`已登录：${session.user.name}${session.is_admin ? '（管理员）' : ''}`);
+    status(`已登录：${session.user.name}`);
     $('tabs').hidden = false;
-    $('tab-admin').hidden = !session.is_admin;
     $('tab-me').onclick = () => showTab('me');
-    $('tab-admin').onclick = () => showTab('admin');
-    await loadMe();
+    $('tab-watch').onclick = () => showTab('watch');
+    renderMe(await api('/api/me'));
     showTab('me');
   } catch (error) {
     status(error.message, true);

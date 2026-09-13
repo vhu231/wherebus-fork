@@ -23,7 +23,7 @@ use crate::bot::telegram::{
     CallbackQuery, Message, Telegram, Update, callback_button, inline_keyboard, keyboard,
     location_keyboard, remove_keyboard, web_app_button,
 };
-use crate::bot::{admin, render, watch};
+use crate::bot::{render, watch};
 use crate::models::{BusRoute, LineDetail, RealTimeData};
 use crate::provider::{self, BusDataProvider};
 use crate::support::coord::wgs84_to_gcj02;
@@ -158,7 +158,7 @@ pub struct App {
     watches: Mutex<HashMap<i64, tokio::task::AbortHandle>>,
     tz_offset: i64,
     started_at: u64,
-    /// Mini App 管理面板地址（必须是 HTTPS，Telegram 才允许打开）
+    /// Mini App「我的面板」地址（必须是 HTTPS，Telegram 才允许打开）
     miniapp_url: Option<String>,
     bot_token: String,
     bot_username: String,
@@ -175,31 +175,25 @@ async fn upstream<T>(
     }
 }
 
-pub async fn run() -> anyhow::Result<()> {
-    let token = std::env::var("WHEREBUS_BOT_TOKEN")
+/// 按环境变量准备机器人；没有配置令牌时返回 None，此时只跑网页版。
+pub async fn start(store: Arc<Store>) -> anyhow::Result<Option<Arc<App>>> {
+    let Some(token) = std::env::var("WHEREBUS_BOT_TOKEN")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("缺少环境变量 WHEREBUS_BOT_TOKEN（向 @BotFather 申请机器人令牌）")
-        })?;
-    let data_path =
-        std::env::var("WHEREBUS_BOT_DATA").unwrap_or_else(|_| "wherebus-bot-data.json".into());
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
     let tz_offset = std::env::var("WHEREBUS_BOT_TZ")
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|offset| (-12..=14).contains(offset))
         .unwrap_or(8);
-
     let miniapp_url = std::env::var("WHEREBUS_BOT_MINIAPP_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let admins = Sessions::parse_admins(&std::env::var("WHEREBUS_BOT_ADMINS").unwrap_or_default());
-
-    let store = Arc::new(Store::load(&data_path)?);
-    store.spawn_autosave(Duration::from_secs(5));
-
-    let token = token.trim().to_string();
     let tg = Telegram::new(&token)?;
     let me = tg.get_me().await?;
     let username = me.username.clone().unwrap_or_else(|| me.first_name.clone());
@@ -207,7 +201,7 @@ pub async fn run() -> anyhow::Result<()> {
     let app = Arc::new(App {
         tg,
         store: Arc::clone(&store),
-        sessions: Arc::new(Sessions::new(admins)),
+        sessions: Arc::new(Sessions::default()),
         tokens: TokenTable::default(),
         providers: Mutex::new(HashMap::new()),
         lines_cache: Mutex::new(HashMap::new()),
@@ -221,10 +215,8 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     println!(
-        "WhereBus Bot: @{username} 已启动 · 数据文件 {} · 已有用户 {} · 管理员 {} · 时区 UTC{:+}",
-        store.path().display(),
+        "机器人：@{username} · 已有用户 {} · 时区 UTC{:+}",
         store.user_count(),
-        app.sessions.admin_count(),
         tz_offset,
     );
     if let Err(error) = app.tg.set_my_commands(COMMANDS).await {
@@ -232,47 +224,46 @@ pub async fn run() -> anyhow::Result<()> {
     }
     match &miniapp_url {
         Some(url) => {
-            // 聊天窗口左下角的菜单按钮直接打开管理面板
-            if let Err(error) = app.tg.set_chat_menu_button(url, "管理面板").await {
+            // 聊天窗口左下角的菜单按钮直接打开「我的面板」
+            if let Err(error) = app.tg.set_chat_menu_button(url, "我的面板").await {
                 eprintln!("[bot] 设置 Mini App 菜单按钮失败：{error}");
             }
-            println!("[bot] Mini App 管理面板：{url}");
+            println!("机器人：Mini App 我的面板 {url}");
         }
-        None => println!("[bot] 未设置 WHEREBUS_BOT_MINIAPP_URL，机器人内不显示管理面板入口"),
+        None => println!("机器人：未设置 WHEREBUS_BOT_MINIAPP_URL，聊天里不显示「我的面板」入口"),
     }
-    admin::serve(Arc::clone(&app)).await?;
     app.restore_watches();
+    Ok(Some(app))
+}
 
-    let mut offset = 0i64;
-    let mut backoff = 1u64;
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("\n[bot] 正在退出，保存用户数据…");
-                break;
-            }
-            updates = app.tg.get_updates(offset) => match updates {
-                Ok(updates) => {
-                    backoff = 1;
-                    for update in updates {
-                        offset = offset.max(update.update_id + 1);
-                        let app = Arc::clone(&app);
-                        tokio::spawn(async move { app.handle(update).await });
+impl App {
+    /// 长轮询主循环，直到 `shutdown` 完成。
+    pub async fn poll_updates(self: &Arc<Self>, shutdown: impl std::future::Future<Output = ()>) {
+        let mut offset = 0i64;
+        let mut backoff = 1u64;
+        let mut shutdown = std::pin::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => return,
+                updates = self.tg.get_updates(offset) => match updates {
+                    Ok(updates) => {
+                        backoff = 1;
+                        for update in updates {
+                            offset = offset.max(update.update_id + 1);
+                            let app = Arc::clone(self);
+                            tokio::spawn(async move { app.handle(update).await });
+                        }
                     }
-                }
-                Err(error) => {
-                    let wait = error.retry_after().unwrap_or(backoff);
-                    eprintln!("[bot] 拉取更新失败：{error}（{wait}s 后重试）");
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                    backoff = (backoff * 2).min(30);
-                }
-            },
+                    Err(error) => {
+                        let wait = error.retry_after().unwrap_or(backoff);
+                        eprintln!("[bot] 拉取更新失败：{error}（{wait}s 后重试）");
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        backoff = (backoff * 2).min(30);
+                    }
+                },
+            }
         }
     }
-
-    store.flush()?;
-    println!("[bot] 用户数据已保存到 {}", store.path().display());
-    Ok(())
 }
 
 impl App {
@@ -604,9 +595,9 @@ impl App {
                 Some(url) => {
                     self.send(
                         chat_id,
-                        "🧭 <b>管理面板</b>
-在小程序里管理收藏、提醒设置与个人数据；管理员还能看到 Bot 运行状态与用户列表。",
-                        Some(keyboard(vec![vec![web_app_button("🧭 打开管理面板", url)]])),
+                        "🧭 <b>我的面板</b>
+在小程序里管理城市、收藏、提醒偏好，并直接开始车次监控。",
+                        Some(keyboard(vec![vec![web_app_button("🧭 打开我的面板", url)]])),
                     )
                     .await;
                 }
@@ -962,7 +953,7 @@ impl App {
             })
             .collect();
         if let Some(url) = &self.miniapp_url {
-            buttons.push(vec![web_app_button("🧭 管理面板", url)]);
+            buttons.push(vec![web_app_button("🧭 我的面板", url)]);
         }
         (text, keyboard(buttons))
     }
@@ -1454,7 +1445,7 @@ impl App {
     }
 
     /// 建立卡片消息并启动盯车循环。
-    async fn start_watch(
+    pub(crate) async fn start_watch(
         self: &Arc<Self>,
         user_id: i64,
         chat_id: i64,
@@ -1884,7 +1875,7 @@ const HELP_TEXT: &str = "🚏 <b>WhereBus 使用说明</b>\n\n\
 <b>盯车</b>（/watch）：选好线路与上车站后，可以指定等某一辆车，或跟随「最近的一班」。\
 默认在目标车还差 1 站时提醒一次，进入 500 米后每 60 秒重复提醒，每 10 秒刷新一次卡片；\
 这些都能在 /settings 里改。车进站或已驶过时自动结束。\n\n\
-/app 打开管理面板（Mini App），可以管理收藏、提醒设置与个人数据。\n\n\
+/app 打开「我的面板」（Mini App）：管理城市、收藏、提醒偏好，也能直接开始车次监控。\n\n\
 数据来自公开的第三方公交数据源，没有任何模拟数据；上游异常时会如实提示。\n\
 你的城市选择、收藏和查询统计保存在运行机器人的服务器本地文件中，/cancel 可取消当前输入。";
 

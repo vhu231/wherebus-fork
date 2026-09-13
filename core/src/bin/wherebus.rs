@@ -1,4 +1,4 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    wherebus::bot::run().await
+    wherebus::runtime::serve().await
 }

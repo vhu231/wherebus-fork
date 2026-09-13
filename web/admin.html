@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhereBus 管理控制台</title>
+<style>
+:root { color-scheme: light dark; --bg:#f6f7f9; --fg:#16181d; --muted:#6b7280; --card:#fff; --line:#e5e7eb; --accent:#2f6fed; --accent-fg:#fff; --danger:#d64545; }
+@media (prefers-color-scheme: dark) { :root { --bg:#14161a; --fg:#e8eaee; --muted:#9aa1ac; --card:#1c1f25; --line:#2b3039; } }
+* { box-sizing: border-box; }
+body { margin:0; padding:20px 16px 48px; font:15px/1.55 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif; background:var(--bg); color:var(--fg); }
+main { max-width: 960px; margin: 0 auto; }
+h1 { font-size:20px; margin:0 0 4px; }
+h2 { font-size:16px; margin:0 0 12px; }
+.muted { color:var(--muted); font-size:13px; }
+.error { color:var(--danger); }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+.row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.row + .row { margin-top:10px; border-top:1px solid var(--line); padding-top:10px; }
+label { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
+input { font:inherit; width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); }
+button { font:inherit; border:0; border-radius:8px; padding:8px 14px; background:var(--accent); color:var(--accent-fg); cursor:pointer; }
+button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+button.danger { background:var(--danger); color:#fff; }
+button:disabled { opacity:.5; cursor:default; }
+form.stack { display:grid; gap:12px; max-width:380px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
+.stat { background:var(--bg); border-radius:10px; padding:10px 12px; }
+.stat b { display:block; font-size:19px; }
+.stepper { display:flex; align-items:center; gap:8px; }
+.stepper output { min-width:88px; text-align:right; font-variant-numeric:tabular-nums; }
+.scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:13px; min-width:620px; }
+th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; background:var(--accent); color:var(--accent-fg); }
+.pill.off { background:var(--muted); }
+.actions { display:flex; gap:6px; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>WhereBus 管理控制台</h1>
+  <p id="status" class="muted">正在检查状态…</p>
+  <section id="view"></section>
+</main>
+<script src="/admin.js"></script>
+</body>
+</html>

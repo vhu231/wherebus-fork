@@ -5,7 +5,7 @@
 //! `hash = HMAC_SHA256(key = secret, msg = 按 key 排序的 "k=v" 用 \n 连接)`。
 //! 服务端只信任这个签名，不信任前端传来的任何用户身份字段。
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, OnceLock},
 };
 
@@ -189,41 +189,17 @@ fn percent_decode(raw: &str) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct Session {
     pub user: TelegramUser,
-    pub is_admin: bool,
     pub issued_at: u64,
 }
 
+#[derive(Default)]
 pub struct Sessions {
     inner: Mutex<HashMap<String, Session>>,
-    admins: HashSet<i64>,
 }
 
 impl Sessions {
-    /// `admins` 来自环境变量 `WHEREBUS_BOT_ADMINS`（逗号分隔的 Telegram 用户 ID）。
-    pub fn new(admins: HashSet<i64>) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            admins,
-        }
-    }
-
-    pub fn parse_admins(raw: &str) -> HashSet<i64> {
-        raw.split([',', ' ', ';'])
-            .filter_map(|item| item.trim().parse::<i64>().ok())
-            .collect()
-    }
-
-    pub fn is_admin(&self, user_id: i64) -> bool {
-        self.admins.contains(&user_id)
-    }
-
-    pub fn admin_count(&self) -> usize {
-        self.admins.len()
-    }
-
     pub fn issue(&self, user: TelegramUser) -> (String, Session) {
         let session = Session {
-            is_admin: self.is_admin(user.id),
             user,
             issued_at: now_secs(),
         };
@@ -258,17 +234,131 @@ impl Sessions {
     }
 }
 
+// ─── 管理控制台口令（网页端，与 Telegram 身份无关） ───
+
+/// PBKDF2-HMAC-SHA256 迭代次数。
+const PBKDF2_ITERATIONS: u32 = 200_000;
+/// 管理控制台会话有效期。
+const ADMIN_SESSION_TTL_SECS: u64 = 8 * 3600;
+
+/// 把口令哈希成 `pbkdf2$sha256$<迭代次数>$<盐>$<哈希>`，存进数据库。
+pub fn hash_password(password: &str) -> String {
+    let mut salt = [0u8; 16];
+    fill_random(&mut salt);
+    let derived = pbkdf2(password.as_bytes(), &salt, PBKDF2_ITERATIONS);
+    format!(
+        "pbkdf2$sha256${PBKDF2_ITERATIONS}${}${}",
+        hex(&salt),
+        hex(&derived)
+    )
+}
+
+/// 常数时间校验口令。
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    let mut parts = stored.split('$');
+    let (Some("pbkdf2"), Some("sha256"), Some(iterations), Some(salt), Some(expected)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    let (Ok(iterations), Some(salt), Some(expected)) = (
+        iterations.parse::<u32>(),
+        decode_hex(salt),
+        decode_hex(expected),
+    ) else {
+        return false;
+    };
+    let derived = pbkdf2(password.as_bytes(), &salt, iterations);
+    constant_time_eq(&derived, &expected)
+}
+
+fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    // PBKDF2 的第一个（也是唯一一个）输出块：U1 = HMAC(password, salt || 0x00000001)
+    let mut block = salt.to_vec();
+    block.extend_from_slice(&1u32.to_be_bytes());
+    let mut current = hmac(password, &block);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&current);
+    for _ in 1..iterations.max(1) {
+        current = hmac(password, &current);
+        for (slot, byte) in output.iter_mut().zip(current.iter()) {
+            *slot ^= byte;
+        }
+    }
+    output
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 管理控制台的会话（登录后签发，仅存在内存里）。
+#[derive(Default)]
+pub struct AdminSessions {
+    inner: Mutex<HashMap<String, u64>>,
+}
+
+impl AdminSessions {
+    pub fn issue(&self) -> String {
+        let token = random_token();
+        let now = now_secs();
+        let mut sessions = self.inner.lock();
+        sessions.retain(|_, issued| now.saturating_sub(*issued) < ADMIN_SESSION_TTL_SECS);
+        sessions.insert(token.clone(), now);
+        token
+    }
+
+    pub fn valid(&self, token: &str) -> bool {
+        match self.inner.lock().get(token) {
+            Some(issued) => now_secs().saturating_sub(*issued) < ADMIN_SESSION_TTL_SECS,
+            None => false,
+        }
+    }
+
+    pub fn revoke(&self, token: &str) {
+        self.inner.lock().remove(token);
+    }
+
+    /// 改口令后作废所有会话。
+    pub fn revoke_all(&self) {
+        self.inner.lock().clear();
+    }
+
+    pub fn active(&self) -> usize {
+        self.inner.lock().len()
+    }
+}
+
 /// 用 rustls 依赖里已有的 CSPRNG 生成会话令牌。
 fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    fill_random(&mut bytes);
+    hex(&bytes)
+}
+
+/// 复用 rustls 依赖里已有的 CSPRNG。
+fn fill_random(bytes: &mut [u8]) {
     static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     let provider =
         PROVIDER.get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
-    let mut bytes = [0u8; 32];
     provider
         .secure_random
-        .fill(&mut bytes)
+        .fill(bytes)
         .expect("系统随机数不可用");
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -359,12 +449,39 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_unique_and_admin_aware() {
-        let sessions = Sessions::new(Sessions::parse_admins("7, 42 ;x"));
-        assert!(sessions.is_admin(42));
-        assert!(!sessions.is_admin(43));
-        assert_eq!(sessions.admin_count(), 2);
+    fn password_hash_roundtrip_and_rejects_wrong_input() {
+        let stored = hash_password("正确的口令");
+        assert!(stored.starts_with("pbkdf2$sha256$"));
+        assert!(verify_password("正确的口令", &stored));
+        assert!(!verify_password("错误的口令", &stored));
+        assert!(!verify_password("", &stored));
+        // 每次哈希都用新的盐
+        assert_ne!(stored, hash_password("正确的口令"));
+        // 存储格式损坏时一律不通过
+        assert!(!verify_password("正确的口令", "乱七八糟"));
+        assert!(!verify_password("正确的口令", "pbkdf2$sha256$x$y$z"));
+    }
 
+    #[test]
+    fn admin_sessions_expire_and_revoke() {
+        let sessions = AdminSessions::default();
+        let token = sessions.issue();
+        assert!(sessions.valid(&token));
+        assert!(!sessions.valid("别的令牌"));
+        sessions.revoke(&token);
+        assert!(!sessions.valid(&token));
+
+        let first = sessions.issue();
+        let second = sessions.issue();
+        assert_ne!(first, second);
+        assert_eq!(sessions.active(), 2);
+        sessions.revoke_all();
+        assert_eq!(sessions.active(), 0);
+    }
+
+    #[test]
+    fn sessions_are_unique_per_login() {
+        let sessions = Sessions::default();
         let user = TelegramUser {
             id: 42,
             name: "小明".into(),
@@ -374,7 +491,7 @@ mod tests {
         let (token_b, _) = sessions.issue(user.clone());
         assert_ne!(token_a, token_b);
         assert_eq!(token_a.len(), 64);
-        assert!(session.is_admin);
+        assert_eq!(session.user.id, 42);
         assert_eq!(sessions.lookup(&token_a).unwrap().user.id, 42);
         assert!(sessions.lookup("不存在").is_none());
 

@@ -1,18 +1,13 @@
-//! 用户数据持久化：城市选择、收藏车次、查询习惯。
+//! 用户数据：城市选择、收藏车次、盯车任务、查询习惯与全局设置。
 //!
-//! 单个 JSON 文件 + 内存读写锁；后台定时落盘（先写临时文件再 rename，避免半截文件）。
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
-};
+//! SQLite 落库（见 [`db`]），内存里保留一份缓存供高频读取；任何改动都会
+//! 立即写入数据库，进程被杀不会丢数据。
+use std::{collections::HashMap, time::{SystemTime, UNIX_EPOCH}};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+
+use super::db::Db;
 
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -281,6 +276,24 @@ pub enum Pending {
     Line,
 }
 
+impl Pending {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::City => "City",
+            Self::Line => "Line",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Self {
+        match raw {
+            "City" => Self::City,
+            "Line" => Self::Line,
+            _ => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserState {
     /// 选中的数据源 id（provider::available_services 的 id）
@@ -454,50 +467,38 @@ impl UserState {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Snapshot {
-    #[serde(default)]
-    users: HashMap<i64, UserState>,
-    #[serde(default)]
-    settings: GlobalSettings,
-}
-
 pub struct Store {
-    path: PathBuf,
+    db: Db,
     users: RwLock<HashMap<i64, UserState>>,
     settings: RwLock<GlobalSettings>,
-    dirty: AtomicBool,
 }
 
 impl Store {
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let snapshot = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<Snapshot>(&bytes).map_err(|e| {
-                anyhow::anyhow!(
-                    "用户数据文件 {} 解析失败: {e}（请修复或移走该文件）",
-                    path.display()
-                )
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Snapshot::default(),
-            Err(error) => {
-                return Err(anyhow::anyhow!("读取 {} 失败: {error}", path.display()));
-            }
-        };
-        let settings = GlobalSettings {
-            defaults: snapshot.settings.defaults.clamped(),
-            ..snapshot.settings
-        };
+    /// 打开（或新建）数据库并把现有数据读进内存缓存。
+    pub fn open(path: &str) -> anyhow::Result<Self> {
+        let db = Db::open(path)?;
+        let users = db.load_users()?;
+        let settings = db.load_settings()?;
         Ok(Self {
-            path,
-            users: RwLock::new(snapshot.users),
+            db,
+            users: RwLock::new(users),
             settings: RwLock::new(settings),
-            dirty: AtomicBool::new(false),
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// 旧版本的 JSON 数据文件：库里还没有用户时导入一次。
+    pub fn import_legacy_json(&self, path: &std::path::Path) -> anyhow::Result<usize> {
+        if !path.exists() || !self.users.read().is_empty() {
+            return Ok(0);
+        }
+        let imported = self.db.import_legacy_json(path)?;
+        *self.users.write() = self.db.load_users()?;
+        *self.settings.write() = self.db.load_settings()?;
+        Ok(imported)
+    }
+
+    pub fn path(&self) -> &str {
+        self.db.path()
     }
 
     pub fn user_count(&self) -> usize {
@@ -527,8 +528,8 @@ impl Store {
     /// 删除一个用户的全部数据。
     pub fn remove(&self, user_id: i64) -> bool {
         let removed = self.users.write().remove(&user_id).is_some();
-        if removed {
-            self.dirty.store(true, Ordering::Relaxed);
+        if removed && let Err(error) = self.db.delete_user(user_id) {
+            eprintln!("[bot] 删除用户 {user_id} 失败: {error}");
         }
         removed
     }
@@ -538,14 +539,29 @@ impl Store {
     }
 
     pub fn update_settings<R>(&self, edit: impl FnOnce(&mut GlobalSettings) -> R) -> R {
-        let result = {
+        let (result, snapshot) = {
             let mut settings = self.settings.write();
             let result = edit(&mut settings);
             settings.defaults = settings.defaults.clamped();
-            result
+            (result, settings.clone())
         };
-        self.dirty.store(true, Ordering::Relaxed);
+        if let Err(error) = self.db.save_settings(&snapshot) {
+            eprintln!("[bot] 写入全局设置失败: {error}");
+        }
         result
+    }
+
+    /// 管理端口令等元数据。
+    pub fn meta_get(&self, key: &str) -> Option<String> {
+        self.db.meta_get(key).ok().flatten()
+    }
+
+    pub fn meta_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.db.meta_set(key, value)
+    }
+
+    pub fn meta_delete(&self, key: &str) -> anyhow::Result<()> {
+        self.db.meta_delete(key)
     }
 
     /// 用户的生效提醒设置：个人设置优先，否则用全局默认值。
@@ -565,66 +581,41 @@ impl Store {
             .collect()
     }
 
-    /// 修改某个用户的数据并标记待落盘。
+    /// 修改某个用户的数据，并立即把这个用户的完整状态写回数据库。
     pub fn update<R>(&self, user_id: i64, edit: impl FnOnce(&mut UserState) -> R) -> R {
-        let result = {
+        let (result, snapshot) = {
             let mut users = self.users.write();
             let state = users.entry(user_id).or_default();
             if state.first_seen == 0 {
                 state.first_seen = now_secs();
             }
             state.last_seen = now_secs();
-            edit(state)
+            let result = edit(state);
+            (result, state.clone())
         };
-        self.dirty.store(true, Ordering::Relaxed);
+        if let Err(error) = self.db.save_user(user_id, &snapshot) {
+            // 内存里的状态仍然是对的，但要让运维看到写库失败
+            tracing::error!("[bot] 写入用户 {user_id} 失败: {error}");
+            eprintln!("[bot] 写入用户 {user_id} 失败: {error}");
+        }
         result
     }
 
-    /// 有改动时写盘：临时文件 + rename，保证原文件不会被写坏。
-    pub fn flush(&self) -> anyhow::Result<()> {
-        if !self.dirty.swap(false, Ordering::Relaxed) {
-            return Ok(());
-        }
-        let snapshot = Snapshot {
-            users: self.users.read().clone(),
-            settings: self.settings.read().clone(),
-        };
-        let bytes = serde_json::to_vec_pretty(&snapshot)?;
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, &bytes)?;
-        // Windows 上 rename 不会覆盖已存在的文件，先删除旧文件
-        if self.path.exists() {
-            let _ = std::fs::remove_file(&self.path);
-        }
-        if let Err(error) = std::fs::rename(&temporary, &self.path) {
-            self.dirty.store(true, Ordering::Relaxed);
-            return Err(error.into());
-        }
-        Ok(())
-    }
-
-    /// 后台定时落盘任务。
-    pub fn spawn_autosave(self: &Arc<Self>, every: std::time::Duration) {
-        let store = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(every);
-            loop {
-                ticker.tick().await;
-                if let Err(error) = store.flush() {
-                    tracing::error!("[bot] 用户数据写入失败: {error}");
-                    eprintln!("[bot] 用户数据写入失败: {error}");
-                }
-            }
-        });
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 每个测试用独立的数据库文件，互不干扰。
+    fn temp_db(tag: &str) -> String {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("wherebus-test-{tag}-{}-{unique}.db", now_secs()))
+            .to_string_lossy()
+            .into_owned()
+    }
 
     fn favorite() -> Favorite {
         Favorite {
@@ -673,21 +664,22 @@ mod tests {
 
     #[test]
     fn store_roundtrips_through_disk() {
-        let path = std::env::temp_dir().join(format!("wherebus-bot-test-{}.json", now_secs()));
-        let store = Store::load(&path).unwrap();
+        let path = temp_db("roundtrip");
+        let store = Store::open(&path).unwrap();
         store.update(42, |user| {
             user.service = Some("shenzhen".into());
             user.toggle_favorite(favorite());
             user.record_query("shenzhen", "M375", "M375:1", "科技园", 5, 8);
         });
-        store.flush().unwrap();
+        // 改动会立即写库，不需要额外的落盘步骤
 
-        let reloaded = Store::load(&path).unwrap();
+        let reloaded = Store::open(&path).unwrap();
         let user = reloaded.get(42);
         assert_eq!(user.service.as_deref(), Some("shenzhen"));
         assert_eq!(user.favorites.len(), 1);
         assert_eq!(user.habits[0].total, 1);
         assert_eq!(reloaded.get(7).favorites.len(), 0);
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -722,8 +714,8 @@ mod tests {
 
     #[test]
     fn personal_alerts_override_global_defaults() {
-        let path = std::env::temp_dir().join(format!("wherebus-bot-alerts-{}.json", now_secs()));
-        let store = Store::load(&path).unwrap();
+        let path = temp_db("alerts");
+        let store = Store::open(&path).unwrap();
         assert_eq!(store.alerts_for(1).poll_secs, 10);
 
         store.update_settings(|settings| settings.defaults.poll_secs = 20);
@@ -737,10 +729,11 @@ mod tests {
         assert_eq!(store.alerts_for(1).poll_secs, 30);
         assert_eq!(store.alerts_for(2).poll_secs, 20);
 
-        store.flush().unwrap();
-        let reloaded = Store::load(&path).unwrap();
+        // 改动会立即写库，不需要额外的落盘步骤
+        let reloaded = Store::open(&path).unwrap();
         assert_eq!(reloaded.settings().defaults.poll_secs, 20);
         assert_eq!(reloaded.alerts_for(1).poll_secs, 30);
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 
