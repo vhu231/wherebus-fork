@@ -128,7 +128,7 @@ async function loadConsole() {
   head.append(out);
   stats.append(head);
   if (!overview.bot_running) {
-    stats.append(el('p', '没有设置 WHEREBUS_BOT_TOKEN，本次只运行网页版；用户数据仍可在这里查看和管理。', 'muted'));
+    stats.append(el('p', '没有设置 TELEGRAM_BOT_TOKEN，本次只运行网页版；用户数据仍可在这里查看和管理。', 'muted'));
   }
   const grid = el('div', null, 'grid');
   [

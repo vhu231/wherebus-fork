@@ -177,7 +177,7 @@ async fn upstream<T>(
 
 /// 按环境变量准备机器人；没有配置令牌时返回 None，此时只跑网页版。
 pub async fn start(store: Arc<Store>) -> anyhow::Result<Option<Arc<App>>> {
-    let Some(token) = std::env::var("WHEREBUS_BOT_TOKEN")
+    let Some(token) = std::env::var("TELEGRAM_BOT_TOKEN")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())

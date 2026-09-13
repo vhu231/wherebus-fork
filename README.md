@@ -61,13 +61,20 @@ cargo run
 
 一条命令同时启动：网页版 <http://127.0.0.1:8080>、管理控制台 <http://127.0.0.1:8080/admin>，以及（配置了令牌时）Telegram 机器人与它的 Mini App 用户面板。前端资源编译内嵌于服务二进制，修改网页后需要重启编译。无需 Node.js 或前端依赖安装。
 
-带机器人启动：
+配置放在仓库根目录的 `.env` 里（[`.env.example`](.env.example) 是模板）：
 
 ```sh
-WHEREBUS_BOT_TOKEN=你的机器人令牌 cargo run
+cp .env.example .env   # 填入 TELEGRAM_BOT_TOKEN 等
+cargo run
 ```
 
-没设置 `WHEREBUS_BOT_TOKEN` 时不启动机器人，网页版与管理控制台照常可用。
+启动时会先读取 `.env`，**真实环境变量优先**，因此也可以临时覆盖：
+
+```sh
+TELEGRAM_BOT_TOKEN=你的机器人令牌 cargo run
+```
+
+没设置 `TELEGRAM_BOT_TOKEN` 时不启动机器人，网页版与管理控制台照常可用。`.env` 已在 `.gitignore` 中，不要提交。
 
 生产构建：
 
@@ -99,11 +106,14 @@ cargo build --release
 
 ### 环境变量
 
+全部配置都可以写进 `.env`（见 [`.env.example`](.env.example)），也可以直接用环境变量；同名时环境变量优先。
+
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | 否 | — | 向 [@BotFather](https://t.me/BotFather) 申请的机器人令牌；不设置就不启动机器人 |
 | `WHEREBUS_BIND` | 否 | `127.0.0.1:8080` | 网页版 / 管理控制台 / Mini App 的监听地址 |
 | `WHEREBUS_DB` | 否 | `wherebus.db` | SQLite 数据库路径 |
-| `WHEREBUS_BOT_TOKEN` | 否 | — | 向 [@BotFather](https://t.me/BotFather) 申请的机器人令牌；不设置就不启动机器人 |
+| `WHEREBUS_ENV_FILE` | 否 | `.env` | 配置文件路径 |
 | `WHEREBUS_BOT_MINIAPP_URL` | 否 | — | 「我的面板」的公网 HTTPS 地址（`https://你的域名/miniapp`），不设置则机器人里不显示入口 |
 | `WHEREBUS_BOT_TZ` | 否 | `8` | 统计习惯、显示时间所用的时区偏移（小时） |
 | `WHEREBUS_BOT_API` | 否 | `https://api.telegram.org` | 自建 Bot API 服务地址，本地联调也用它 |

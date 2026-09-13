@@ -1,11 +1,24 @@
 //! 单进程启动：网页版、管理控制台与 Telegram 机器人一起跑，共用同一个端口和同一个 SQLite 库。
 //!
-//! 没有配置 `WHEREBUS_BOT_TOKEN` 时不启动机器人，网页版与管理控制台照常可用。
+//! 配置来自环境变量，启动时会先读取当前目录的 `.env`（真实环境变量优先）。
+//! 没有配置 `TELEGRAM_BOT_TOKEN` 时不启动机器人，网页版与管理控制台照常可用。
 use std::{path::Path, sync::Arc};
 
 use crate::bot::{console, miniapp, store::Store};
 
 pub async fn serve() -> anyhow::Result<()> {
+    // 先读 .env（已存在的环境变量优先），再解析各项配置
+    let env_file = std::env::var("WHEREBUS_ENV_FILE").unwrap_or_else(|_| ".env".into());
+    let loaded = crate::support::dotenv::load(&env_file);
+    if !loaded.is_empty() {
+        println!("已从 {env_file} 载入 {} 个配置项", loaded.len());
+    }
+    if std::env::var_os("WHEREBUS_BOT_TOKEN").is_some()
+        && std::env::var_os("TELEGRAM_BOT_TOKEN").is_none()
+    {
+        eprintln!("提示：WHEREBUS_BOT_TOKEN 已更名为 TELEGRAM_BOT_TOKEN，请更新配置");
+    }
+
     let address = std::env::var("WHEREBUS_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let db_path = std::env::var("WHEREBUS_DB").unwrap_or_else(|_| "wherebus.db".into());
 
@@ -33,7 +46,7 @@ pub async fn serve() -> anyhow::Result<()> {
     println!("管理控制台：http://{address}/admin · 数据库 {db_path}");
     match &bot {
         Some(_) => println!("Mini App（用户面板）：http://{address}/miniapp"),
-        None => println!("未设置 WHEREBUS_BOT_TOKEN，本次不启动机器人（网页与控制台照常可用）"),
+        None => println!("未设置 TELEGRAM_BOT_TOKEN，本次不启动机器人（网页与控制台照常可用）"),
     }
 
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown());
