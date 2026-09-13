@@ -116,13 +116,23 @@ sudo systemctl stop wherebus
 - 默认只监听 `127.0.0.1:8080`。要从外网访问就配一个 HTTPS 反向代理指过去；直接把 `WHEREBUS_BIND` 改成 `0.0.0.0:8080` 会把管理控制台裸露在公网上。
 - 机器人是长轮询出站连接，不需要公网入口，也不需要开端口。
 
-更新到新版本（[`deploy/update.sh`](deploy/update.sh) 就是这三步）：
+### 更新（一键脚本）
+
+代码更新后跑 [`deploy/update.sh`](deploy/update.sh)：拉代码 → 编译 release → 重启 → 健康检查。
 
 ```sh
-./deploy/update.sh             # git pull → cargo build --release → systemctl restart
+./deploy/update.sh             # 完整更新
+./deploy/update.sh --no-pull   # 代码已是最新，只编译并重启
+./deploy/update.sh --restart   # 不编译，只重启（改完 .env 用这个）
 ```
 
-临时想在后台跑一下、不装服务，可以用 `tmux`（推荐，随时能回去看）或：
+几点设计：
+
+- **编译失败就退出**，不会去动正在运行的服务；工作区有未提交改动时也会先停下来提示。
+- 装了 systemd 服务就 `systemctl restart`；**没装则退到后台运行**（先停掉上一次的进程，PID 记在 `wherebus.pid`，日志写 `wherebus.log`）。
+- 最后按 `.env` 里的 `WHEREBUS_BIND` 探 `/api/health`，就绪了打印访问地址；20 秒还没起来就报错并告诉你去哪看日志。
+
+不想用脚本、只是临时跑一下，`tmux` 最省事，或者：
 
 ```sh
 nohup ./target/release/wherebus > wherebus.log 2>&1 &

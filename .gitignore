@@ -9,6 +9,10 @@
 # 本地配置（.env.example 是模板，可提交）
 .env
 
+# 未装成服务时后台运行留下的文件
+wherebus.pid
+wherebus.log
+
 # 用户数据库与旧版 JSON 数据
 wherebus.db
 wherebus.db-wal
