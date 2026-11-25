@@ -130,6 +130,8 @@ struct ResponseParameters {
 pub struct Telegram {
     client: reqwest::Client,
     base: String,
+    /// 仅用于日志脱敏：reqwest 的错误信息里带完整请求 URL，而 URL 含令牌
+    token: String,
 }
 
 impl Telegram {
@@ -155,6 +157,7 @@ impl Telegram {
         Ok(Self {
             client,
             base: format!("{}/bot{}", host.trim_end_matches('/'), token),
+            token: token.to_string(),
         })
     }
 
@@ -165,12 +168,11 @@ impl Telegram {
             .json(&body)
             .send()
             .await
-            .map_err(|e| TgError::Network(e.to_string()))?;
+            .map_err(|error| TgError::Network(self.scrub(&error.to_string())))?;
 
-        let payload: Envelope<T> = response
-            .json()
-            .await
-            .map_err(|e| TgError::Network(format!("响应解析失败: {e}")))?;
+        let payload: Envelope<T> = response.json().await.map_err(|error| {
+            TgError::Network(format!("响应解析失败: {}", self.scrub(&error.to_string())))
+        })?;
 
         match (payload.ok, payload.result) {
             (true, Some(result)) => Ok(result),
@@ -185,6 +187,11 @@ impl Telegram {
                 retry_after: payload.parameters.and_then(|p| p.retry_after),
             }),
         }
+    }
+
+    /// 把错误信息里的接口地址与令牌抹掉，避免写进日志。
+    fn scrub(&self, message: &str) -> String {
+        scrub_secrets(message, &self.base, &self.token)
     }
 
     pub async fn get_me(&self) -> TgResult<User> {
@@ -287,6 +294,20 @@ impl Telegram {
     }
 }
 
+/// 日志脱敏。
+///
+/// reqwest 的网络错误会带上完整请求 URL（形如
+/// `error sending request for url (https://api.telegram.org/bot<令牌>/getUpdates)`）。
+/// 机器人连不上 Telegram 时会反复重试，直接打印等于把令牌成千上万次写进日志文件，
+/// 所以把接口地址与令牌本身都换成占位符。
+fn scrub_secrets(message: &str, base: &str, token: &str) -> String {
+    let mut out = message.replace(base, "<telegram-api>");
+    if !token.is_empty() {
+        out = out.replace(token, "<token>");
+    }
+    out
+}
+
 /// 超长文本按字符截断，避免触发 Telegram 的 4096 限制。
 fn clamp(text: &str) -> String {
     if text.chars().count() <= MAX_TEXT_CHARS {
@@ -331,6 +352,34 @@ pub fn command_keyboard() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_never_leak_the_bot_token() {
+        // 虚构的令牌，只用于测试
+        let token = "111222333:TEST-ONLY-NOT-A-REAL-TOKEN";
+        let base = format!("https://api.telegram.org/bot{token}");
+
+        // reqwest 网络错误的典型形态
+        let message = format!("error sending request for url ({base}/getUpdates)");
+        let scrubbed = scrub_secrets(&message, &base, token);
+        assert!(!scrubbed.contains(token), "脱敏后仍含令牌：{scrubbed}");
+        assert_eq!(
+            scrubbed,
+            "error sending request for url (<telegram-api>/getUpdates)"
+        );
+
+        // 令牌单独出现时同样要挡掉
+        assert_eq!(
+            scrub_secrets(&format!("token={token} failed"), &base, token),
+            "token=<token> failed"
+        );
+
+        // 不含敏感信息的消息保持原样
+        assert_eq!(
+            scrub_secrets("connection reset by peer", &base, token),
+            "connection reset by peer"
+        );
+    }
 
     #[test]
     fn long_text_is_truncated_with_notice() {
